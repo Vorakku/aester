@@ -263,36 +263,7 @@ export function SettingsPage() {
                     confirm(
                       'Begin an empty workspace?',
                       'All products, batches, contacts, invoices, purchase orders, and financial records will be cleared. Company settings and warehouse locations are kept.',
-                      () =>
-                        replace(
-                          {
-                            ...state,
-                            counters: {
-                              invoice: 1,
-                              purchase: 1,
-                              transfer: 1,
-                              adjustment: 1,
-                              count: 1,
-                              recall: 1,
-                              reservation: 1,
-                            },
-                            products: [],
-                            batches: [],
-                            contacts: [],
-                            invoices: [],
-                            purchases: [],
-                            receipts: [],
-                            journal: [],
-                            expenses: [],
-                            movements: [],
-                            stockMoves: [],
-                            adjustments: [],
-                            stockCounts: [],
-                            recalls: [],
-                            reservations: [],
-                          },
-                          'Your empty workspace is ready.',
-                        ),
+                      () => replace(A.emptyWorkspace(state), 'Your empty workspace is ready.'),
                       'Start empty',
                     )
                   }

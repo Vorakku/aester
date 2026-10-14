@@ -16,34 +16,9 @@ function assertInvariants(s: Workspace) {
   expect(A.validateBackup(JSON.parse(JSON.stringify(s)))).toEqual(s);
 }
 function empty(): Workspace {
-  return {
-    ...A.seed(),
-    settings: { ...A.seed().settings, minShelfLifeDays: 0 },
-    recalls: [],
-    reorderRules: [],
-    reservations: [],
-    products: [],
-    batches: [],
-    invoices: [],
-    purchases: [],
-    receipts: [],
-    contacts: [],
-    journal: [],
-    expenses: [],
-    movements: [],
-    stockMoves: [],
-    adjustments: [],
-    stockCounts: [],
-    counters: {
-      invoice: 1,
-      purchase: 1,
-      transfer: 1,
-      adjustment: 1,
-      count: 1,
-      recall: 1,
-      reservation: 1,
-    },
-  };
+  const s = A.emptyWorkspace(A.seed());
+  s.settings.minShelfLifeDays = 0;
+  return s;
 }
 function stocked() {
   const s = empty();
@@ -99,6 +74,86 @@ function stocked() {
   });
   return { s, supplier, customer, p, late, early };
 }
+describe('workspace recovery', () => {
+  it('empties every collection and resets counters while keeping settings and warehouses', () => {
+    const seed = A.seed();
+    const before = structuredClone(seed);
+    const s = A.emptyWorkspace(seed);
+    expect(s.settings).toEqual(seed.settings);
+    expect(s.warehouses).toEqual(seed.warehouses);
+    expect(Object.values(s.counters).every((value) => value === 1)).toBe(true);
+    for (const [key, value] of Object.entries(s)) {
+      if (Array.isArray(value) && key !== 'warehouses') expect(value).toEqual([]);
+    }
+    assertInvariants(s);
+    s.settings.company = 'Independent workspace';
+    s.warehouses[0].name = 'Independent warehouse';
+    expect(seed).toEqual(before);
+    assertInvariants(s);
+    assertInvariants(seed);
+  });
+
+  it.each(['', '{ unreadable JSON', '{}', '{"version":999}'])(
+    'preserves unreadable storage exactly before opening samples: %j',
+    (raw) => {
+      const storage = new Map([[A.KEY, raw]]);
+      vi.stubGlobal('localStorage', {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+      });
+      try {
+        const s = A.load();
+        expect(s.products.length).toBeGreaterThan(0);
+        expect(storage.get(A.KEY)).toBe(raw);
+        expect(storage.get(A.RECOVERY_KEY)).toBe(raw);
+        assertInvariants(s);
+        const next = A.emptyWorkspace(s);
+        A.persist(next);
+        expect(A.load()).toEqual(next);
+        expect(storage.get(A.RECOVERY_KEY)).toBe(raw);
+        assertInvariants(next);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it('loads valid data and missing storage without creating recovery data', () => {
+    const s = empty();
+    const getItem = vi.fn().mockReturnValue(JSON.stringify(s));
+    const setItem = vi.fn();
+    vi.stubGlobal('localStorage', { getItem, setItem });
+    try {
+      expect(A.load()).toEqual(s);
+      getItem.mockReturnValue(null);
+      assertInvariants(A.load());
+      expect(setItem).not.toHaveBeenCalled();
+      assertInvariants(s);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('refuses to open if recovery cannot be saved or storage cannot be read', () => {
+    const getItem = vi.fn().mockReturnValue('{ unreadable JSON');
+    const setItem = vi.fn(() => {
+      throw new Error('Storage is full.');
+    });
+    vi.stubGlobal('localStorage', { getItem, setItem });
+    try {
+      expect(A.load).toThrow('Storage is full.');
+      expect(setItem).toHaveBeenCalledExactlyOnceWith(A.RECOVERY_KEY, '{ unreadable JSON');
+      getItem.mockImplementation(() => {
+        throw new Error('Storage is unavailable.');
+      });
+      expect(A.load).toThrow('Storage is unavailable.');
+      expect(setItem).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe('reserved stock', () => {
   const draft = (s: Workspace, customerId: string, productId: string, qty: number) =>
     A.createInvoice(s, {
@@ -695,6 +750,18 @@ describe('expiry rules and recalls', () => {
     assertInvariants(s);
   });
 
+  it('reports sellable stock shortages without suggesting consent already given', () => {
+    const { s, customer, p } = stocked();
+    A.setMinShelfLife(s, 180);
+    const inv = invoiceFor(s, customer.id, p.id, 31, true);
+    const before = structuredClone(s);
+    expect(() => A.transact(s, (copy) => A.issueInvoice(copy, inv.id))).toThrow(
+      'Not enough sellable stock: Test product (need 31, available 30).',
+    );
+    expect(s).toEqual(before);
+    assertInvariants(s);
+  });
+
   it('blocks sales and receipts across warehouses case-insensitively, allows transfers, and closes after recall write-offs', () => {
     const { s, customer, p, early, late } = stocked();
     const sale = invoiceFor(s, customer.id, p.id, 3);
@@ -714,7 +781,7 @@ describe('expiry rules and recalls', () => {
     const inv = invoiceFor(s, customer.id, p.id, 21, true);
     const before = structuredClone(s);
     expect(() => A.transact(s, (copy) => A.issueInvoice(copy, inv.id))).toThrow(
-      'Only 20 boxes of Test product have at least 0 days of shelf life (0 more are short-dated).',
+      'Not enough sellable stock: Test product (need 21, available 20).',
     );
     expect(() =>
       A.transact(s, (copy) =>
@@ -1115,6 +1182,35 @@ describe('pharma product fields', () => {
     assertInvariants(s);
   });
 
+  it.each(['Active', 'Expired', 'Released'] as const)(
+    'only blocks retirement for a non-expired Active reservation: %s',
+    (status) => {
+      const { s, p, customer, early, late } = stocked();
+      const hold = A.holdStock(s, {
+        productId: p.id,
+        customerId: customer.id,
+        qty: 1,
+        expires: A.today(),
+      });
+      A.adjustStock(s, { batchId: early.id, qty: -early.qty, reason: 'lost' });
+      A.adjustStock(s, { batchId: late.id, qty: -late.qty, reason: 'lost' });
+      if (status === 'Expired') hold.expires = A.shift(-1);
+      if (status === 'Released') A.releaseReservation(s, hold.id);
+      if (status === 'Active') {
+        const before = structuredClone(s);
+        expect(A.inactiveReason(s, p.id)).toBe('Test product still has stock or open documents.');
+        expect(() =>
+          A.transact(s, (copy) => A.saveProduct(copy, { ...p, active: false }, p.id)),
+        ).toThrow('Test product still has stock or open documents.');
+        expect(s).toEqual(before);
+        A.releaseReservation(s, hold.id);
+      }
+      expect(A.inactiveReason(s, p.id)).toBe('');
+      expect(A.saveProduct(s, { ...p, active: false }, p.id).active).toBe(false);
+      assertInvariants(s);
+    },
+  );
+
   it('returns Diazepam moves with running balances, including carry-in and grouping per product and lot across warehouses', () => {
     const s = A.seed();
     assertInvariants(s);
@@ -1337,7 +1433,7 @@ describe('stock counts', () => {
       customerId: customer.id,
       date: A.today(),
       due: A.shift(30),
-      lines: [{ productId: p.id, qty: 1 }],
+      lines: [{ productId: p.id, qty: 6 }],
     });
     const po = A.createPurchase(s, {
       supplierId: supplier.id,
@@ -1374,6 +1470,67 @@ describe('stock counts', () => {
       }),
     ).toThrow(
       `Central warehouse is being counted (${count.number}). Post or cancel the count first.`,
+    );
+    expect(s).toEqual(before);
+    assertInvariants(s);
+  });
+
+  it('sells the same product from the branch while the main warehouse is being counted', () => {
+    const { s, p, customer, early, late } = stocked();
+    const branch = A.receiveStock(s, {
+      productId: p.id,
+      warehouseId: 'wh_branch',
+      qty: 10,
+      cost: 2,
+      code: 'BRANCH',
+      expiry: A.shift(150),
+    });
+    const count = A.startCount(s, { warehouseId: 'wh_main' });
+    const snapshot = structuredClone(count);
+    const opts = { customerId: customer.id, allowShortDated: false };
+    expect(A.eligibleBatches(s, p.id, opts).map((b) => b.id)).toEqual([branch.id]);
+    expect(A.sellableQty(s, p.id, opts)).toBe(10);
+    const invoice = A.createInvoice(s, {
+      customerId: customer.id,
+      date: A.today(),
+      due: A.shift(30),
+      lines: [{ productId: p.id, qty: 10 }],
+    });
+    A.issueInvoice(s, invoice.id);
+    expect(invoice.status).toBe('Issued');
+    expect(invoice.allocations).toMatchObject([{ batchId: branch.id, qty: 10 }]);
+    expect(branch.qty).toBe(0);
+    expect([early.qty, late.qty]).toEqual([10, 20]);
+    expect(count).toEqual(snapshot);
+    assertInvariants(s);
+
+    const frozen = A.createInvoice(s, {
+      customerId: customer.id,
+      date: A.today(),
+      due: A.shift(30),
+      lines: [{ productId: p.id, qty: 1 }],
+    });
+    const before = structuredClone(s);
+    expect(() => A.transact(s, (copy) => A.issueInvoice(copy, frozen.id))).toThrow(
+      `Central warehouse is being counted (${count.number}). Post or cancel the count first.`,
+    );
+    expect(s).toEqual(before);
+    assertInvariants(s);
+  });
+
+  it('reports a shortage when even frozen stock cannot cover demand', () => {
+    const { s, p, customer } = stocked();
+    A.startCount(s, { warehouseId: 'wh_main' });
+    const invoice = A.createInvoice(s, {
+      customerId: customer.id,
+      date: A.today(),
+      due: A.shift(30),
+      allowShortDated: true,
+      lines: [{ productId: p.id, qty: 31 }],
+    });
+    const before = structuredClone(s);
+    expect(() => A.transact(s, (copy) => A.issueInvoice(copy, invoice.id))).toThrow(
+      'Not enough sellable stock: Test product (need 31, available 0).',
     );
     expect(s).toEqual(before);
     assertInvariants(s);
@@ -2133,6 +2290,27 @@ describe('units of measure', () => {
       { account: 'payable', debit: 0, credit: 175.44 },
       { account: 'loss', debit: 0.24, credit: 0 },
     ]);
+    assertInvariants(s);
+  });
+
+  it.each([
+    ['carton', 3, '3 cartons'],
+    ['carton', 1, '1 carton'],
+    ['box', 3, '3 boxes'],
+    ['box', 1, '1 box'],
+    [undefined, 3, '3 boxes'],
+  ] as const)('describes receipts in the received unit (%s, %s)', (unit, qty, label) => {
+    const { s, p } = packaged();
+    A.receiveStock(s, {
+      productId: p.id,
+      warehouseId: 'wh_main',
+      unit,
+      qty,
+      cost: 2,
+      code: 'ACTIVITY-UNIT',
+      expiry: A.shift(365),
+    });
+    expect(s.movements[0].description).toBe(`${label} · ${p.name} · Central warehouse`);
     assertInvariants(s);
   });
 

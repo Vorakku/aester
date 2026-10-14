@@ -64,6 +64,7 @@ interface Toast {
 }
 interface Context {
   state: Workspace;
+  recoveryData: string | null;
   page: Page;
   period: number;
   setPeriod: (value: number) => void;
@@ -92,6 +93,7 @@ const WorkspaceContext = createContext<Context | null>(null);
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<Workspace>(A.load);
+  const [recoveryData] = useState(() => localStorage.getItem(A.RECOVERY_KEY));
   const stateRef = useRef(state);
   const [page, setPage] = useState<Page>(() =>
     isPage(location.hash.slice(1)) ? (location.hash.slice(1) as Page) : 'dashboard',
@@ -179,6 +181,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     <WorkspaceContext.Provider
       value={{
         state,
+        recoveryData,
         page,
         period,
         setPeriod,

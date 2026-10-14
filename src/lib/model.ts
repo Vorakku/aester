@@ -38,6 +38,7 @@ import type {
 export const CURRENT_USER = 'Krisstoff';
 const COUNT_POSTING = Symbol('count posting');
 const KEY = 'aster_pharmacy_workspace_v1';
+const RECOVERY_KEY = 'aster_pharmacy_recovery';
 const round = (n: NumericInput) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const today = () => {
   const d = new Date();
@@ -124,7 +125,8 @@ function inactiveReason(s: Workspace, id: string): string {
   required(p, 'Product not found.');
   return onHand(s, id) > 0 ||
     s.invoices.some((i) => i.status === 'Draft' && i.lines.some((l) => l.productId === id)) ||
-    s.purchases.some((p) => p.status === 'Ordered' && p.lines.some((l) => l.productId === id))
+    s.purchases.some((p) => p.status === 'Ordered' && p.lines.some((l) => l.productId === id)) ||
+    reserved(s, id) > 0
     ? `${p.name} still has stock or open documents.`
     : '';
 }
@@ -348,17 +350,20 @@ function setMinShelfLife(s: Workspace, value: NumericInput): void {
 const shelfLifeFor = (s: Workspace, customerId: string) =>
   contact(s, customerId)?.minShelfLifeDays ?? s.settings.minShelfLifeDays;
 type SaleOptions = { customerId: string; allowShortDated: boolean };
+const warehouseOpenCount = (s: Workspace, warehouseId: string) =>
+  s.stockCounts.find((c) => c.warehouseId === warehouseId && c.status === 'Open');
+const countFreezeMessage = (s: Workspace, count: StockCount) =>
+  `${warehouse(s, count.warehouseId)!.name} is being counted (${count.number}). Post or cancel the count first.`;
+const sellableBatch = (s: Workspace, b: Batch, productId: string, opts: SaleOptions) =>
+  b.productId === productId &&
+  b.qty > 0 &&
+  !b.quarantined &&
+  !isRecalled(s, b) &&
+  daysLeft(b.expiry) > 0 &&
+  (opts.allowShortDated || daysLeft(b.expiry) >= shelfLifeFor(s, opts.customerId));
 const eligibleBatches = (s: Workspace, productId: string, opts: SaleOptions): Batch[] =>
   s.batches
-    .filter(
-      (b) =>
-        b.productId === productId &&
-        b.qty > 0 &&
-        !b.quarantined &&
-        !isRecalled(s, b) &&
-        daysLeft(b.expiry) > 0 &&
-        (opts.allowShortDated || daysLeft(b.expiry) >= shelfLifeFor(s, opts.customerId)),
-    )
+    .filter((b) => sellableBatch(s, b, productId, opts) && !warehouseOpenCount(s, b.warehouseId))
     .sort((a, b) => a.expiry.localeCompare(b.expiry) || a.received.localeCompare(b.received));
 const sellableQty = (s: Workspace, productId: string, opts: SaleOptions) =>
   eligibleBatches(s, productId, opts).reduce((n, b) => n + b.qty, 0);
@@ -872,13 +877,8 @@ function moveStock(
     );
   }
   // ponytail: whole-warehouse freeze keeps counts exact; counts must be short (after hours). Upgrade to per-line snapshots if counts need to run during trading.
-  const count = s.stockCounts.find(
-    (c) => c.warehouseId === batch.warehouseId && c.status === 'Open',
-  );
-  required(
-    !count || countPosting === COUNT_POSTING,
-    `${warehouse(s, batch.warehouseId)?.name} is being counted (${count?.number}). Post or cancel the count first.`,
-  );
+  const count = warehouseOpenCount(s, batch.warehouseId);
+  required(!count || countPosting === COUNT_POSTING, count ? countFreezeMessage(s, count) : '');
   required(Number.isSafeInteger(qty) && qty !== 0, 'Quantity must be a non-zero safe integer.');
   dateCheck(meta.date);
   required(batch.qty + qty >= 0, `Not enough stock in lot ${batch.code} (${batch.qty} available).`);
@@ -1156,7 +1156,7 @@ function receiveStock(s: Workspace, data: StockInput) {
     s,
     'receive',
     'Stock received',
-    `${data.qty} ${product(s, data.productId)!.unit}s · ${product(s, data.productId)!.name} · ${warehouse(s, data.warehouseId)!.name}`,
+    `${qty} ${unitLabel(data.unit ?? p.unit, qty)} · ${p.name} · ${warehouse(s, data.warehouseId)!.name}`,
   );
   return batch;
 }
@@ -1402,13 +1402,24 @@ function issueInvoice(s: Workspace, id: string) {
   Object.keys(demand).forEach((id) => {
     const p = product(s, id)!,
       qty = free(s, id, { ...opts, exceptSourceId: inv.id }),
+      sellable = sellableQty(s, id, opts),
       long = sellableQty(s, id, { ...opts, allowShortDated: false }),
       short = sellableQty(s, id, { ...opts, allowShortDated: true }) - long;
+    if (qty < demand[id]) {
+      const frozen = s.batches.filter(
+        (b) => sellableBatch(s, b, id, opts) && warehouseOpenCount(s, b.warehouseId),
+      );
+      if (frozen.length && qty + sum(frozen, (b) => b.qty) >= demand[id]) {
+        throw new Error(countFreezeMessage(s, warehouseOpenCount(s, frozen[0].warehouseId)!));
+      }
+    }
     required(
       qty >= demand[id],
-      sellableQty(s, id, opts) >= demand[id]
+      sellable >= demand[id]
         ? `Not enough free stock: ${p.name} (need ${demand[id]}, free ${qty}).`
-        : `Only ${long} ${unitLabel(p.unit, long)} of ${p.name} have at least ${shelfLifeFor(s, inv.customerId)} days of shelf life (${short} more are short-dated). Tick "Allow short-dated stock" if the customer accepts them.`,
+        : opts.allowShortDated
+          ? `Not enough sellable stock: ${p.name} (need ${demand[id]}, available ${sellable}).`
+          : `Only ${long} ${unitLabel(p.unit, long)} of ${p.name} have at least ${shelfLifeFor(s, inv.customerId)} days of shelf life (${short} more are short-dated). Tick "Allow short-dated stock" if the customer accepts them.`,
     );
   });
   const allocations: Allocation[] = [];
@@ -1726,13 +1737,48 @@ function persist(s: Workspace) {
   localStorage.setItem(KEY, JSON.stringify(s));
 }
 function load(): Workspace {
+  const raw = localStorage.getItem(KEY);
+  if (raw === null) return seed();
   try {
-    const raw = localStorage.getItem(KEY);
-    if (raw) return validateBackup(migrate(JSON.parse(raw)));
+    return validateBackup(JSON.parse(raw));
   } catch {
-    /* Invalid or unavailable storage uses a fresh demo. */
+    // Preserve the exact input before allowing any mutations to the fresh workspace.
+    // If recovery cannot be saved, fail to open rather than risk overwriting the original.
+    localStorage.setItem(RECOVERY_KEY, raw);
+    return seed();
   }
-  return seed();
+}
+function emptyWorkspace(s: Workspace): Workspace {
+  return {
+    version: s.version,
+    createdAt: s.createdAt,
+    settings: structuredClone(s.settings),
+    warehouses: structuredClone(s.warehouses),
+    counters: {
+      invoice: 1,
+      purchase: 1,
+      transfer: 1,
+      adjustment: 1,
+      count: 1,
+      recall: 1,
+      reservation: 1,
+    },
+    products: [],
+    batches: [],
+    contacts: [],
+    invoices: [],
+    purchases: [],
+    receipts: [],
+    journal: [],
+    expenses: [],
+    movements: [],
+    stockMoves: [],
+    adjustments: [],
+    stockCounts: [],
+    recalls: [],
+    reorderRules: [],
+    reservations: [],
+  };
 }
 function seed(): Workspace {
   const s: Workspace = {
@@ -3246,6 +3292,7 @@ function validateBackup(value: unknown): Workspace {
 }
 export const A = {
   KEY,
+  RECOVERY_KEY,
   round,
   today,
   shift,
@@ -3335,6 +3382,7 @@ export const A = {
   transact,
   persist,
   load,
+  emptyWorkspace,
   seed,
   migrate,
   validateBackup,

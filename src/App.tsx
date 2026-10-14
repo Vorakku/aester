@@ -1,7 +1,15 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { pageNames, useWorkspace, WorkspaceProvider } from './context/WorkspaceContext';
-import { Icon, IconButton, Mark, useStockAlerts, type IconName } from './components/ui';
+import {
+  Button,
+  Callout,
+  Icon,
+  IconButton,
+  Mark,
+  useStockAlerts,
+  type IconName,
+} from './components/ui';
 import { DialogHost } from './components/Dialogs';
 import { AccountingPage } from './pages/Accounting';
 import { AnalyticsPage, DashboardPage } from './pages/Dashboard';
@@ -16,9 +24,10 @@ import {
 import { SettingsPage } from './pages/Settings';
 import type { Page } from './types';
 import { A } from './lib/model';
+import { download } from './lib/format';
 
 function WorkspaceApp() {
-  const { state, page, navigate, dialog, open, close, toasts } = useWorkspace();
+  const { state, recoveryData, page, navigate, dialog, open, close, toasts } = useWorkspace();
   const { expiry, low, recalls, holds, overReserved } = useStockAlerts();
   const [menu, setMenu] = useState(false);
   useEffect(() => setMenu(false), [page]);
@@ -181,6 +190,25 @@ function WorkspaceApp() {
             </div>
           </header>
           <main id="app" tabIndex={-1} key={page}>
+            {recoveryData !== null && (
+              <div role="alert">
+                <Callout>
+                  <p>
+                    Your saved workspace could not be loaded. Sample data was opened instead. Your
+                    unreadable data has been kept on this browser for recovery.
+                  </p>
+                  <Button
+                    tone=""
+                    icon="download"
+                    onClick={() =>
+                      download('aster-unreadable-data.json', recoveryData, 'application/json')
+                    }
+                  >
+                    Download unreadable data
+                  </Button>
+                </Callout>
+              </div>
+            )}
             {views[page]}
           </main>
           <footer className="workspace-footer">

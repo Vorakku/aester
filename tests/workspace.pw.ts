@@ -6,6 +6,38 @@ async function saved(page: Page) {
   );
 }
 
+test('unreadable workspace data remains downloadable after navigation, mutations and reload', async ({
+  page,
+}) => {
+  const raw = '  { "workspace": "unreadable data", broken JSON\n';
+  await page.goto('/#settings');
+  await page.evaluate((value) => localStorage.setItem('aster_pharmacy_workspace_v1', value), raw);
+  await page.reload();
+  const banner = page.getByRole('alert');
+  await expect(banner).toContainText('Your saved workspace could not be loaded.');
+  expect(await page.evaluate(() => localStorage.getItem('aster_pharmacy_workspace_v1'))).toBe(raw);
+  expect(await page.evaluate(() => localStorage.getItem('aster_pharmacy_recovery'))).toBe(raw);
+  await page.getByLabel('Company name').fill('Recovery workspace');
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+  expect((await saved(page)).settings.company).toBe('Recovery workspace');
+  await page.goto('/#inventory');
+  await expect(banner).toBeVisible();
+  await page.reload();
+  await expect(banner).toBeVisible();
+  expect((await saved(page)).settings.company).toBe('Recovery workspace');
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    banner.getByRole('button', { name: 'Download unreadable data', exact: true }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe('aster-unreadable-data.json');
+  const stream = await download.createReadStream(),
+    chunks: Buffer[] = [];
+  for await (const chunk of stream!) chunks.push(Buffer.from(chunk));
+  expect(Buffer.concat(chunks).toString('utf8')).toBe(raw);
+  expect(await page.evaluate(() => localStorage.getItem('aster_pharmacy_recovery'))).toBe(raw);
+  await expect(banner).toBeVisible();
+});
+
 test('hold stock lowers Free, converts to a reserved invoice, and is fulfilled on issue', async ({
   page,
 }) => {
@@ -862,6 +894,13 @@ test('mobile navigation, modal focus, and empty/reset flows work', async ({ page
   await page.getByRole('button', { name: 'Data & backups', exact: true }).click();
   await page.getByRole('button', { name: 'Start empty workspace' }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Start empty', exact: true }).click();
+  expect((await saved(page)).reorderRules).toEqual([]);
+  await page.reload();
+  await page.getByLabel('Company name').fill('Empty workspace pharmacy');
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+  expect((await saved(page)).products).toEqual([]);
+  expect((await saved(page)).settings.company).toBe('Empty workspace pharmacy');
+  expect(await page.evaluate(() => localStorage.getItem('aster_pharmacy_recovery'))).toBeNull();
   await page.goto('/#dashboard');
   await expect(page.getByText('No invoices yet')).toBeVisible();
   await page.goto('/#analytics');
