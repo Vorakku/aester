@@ -1,0 +1,35 @@
+# Dependencies and caches
+node_modules/
+.npm-cache/
+.vite/
+*.tsbuildinfo
+
+# Build output
+dist/
+
+# Test output
+coverage/
+playwright-report/
+blob-report/
+test-results/
+playwright/.cache/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment / secrets (commit an .env.example instead)
+.env
+.env.*
+!.env.example
+
+# Editors and AI tool local settings
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.claude/settings.local.json
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
