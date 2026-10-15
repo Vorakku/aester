@@ -5,6 +5,8 @@ export type Page =
   | 'warehouses'
   | 'purchasing'
   | 'invoices'
+  | 'orders'
+  | 'deliveries'
   | 'pricing'
   | 'accounting'
   | 'analytics'
@@ -96,7 +98,7 @@ export interface Batch {
   quarantined: boolean;
 }
 export type MoveType =
-  'opening' | 'receipt' | 'sale' | 'transfer_out' | 'transfer_in' | 'adjustment';
+  'opening' | 'receipt' | 'sale' | 'return' | 'transfer_out' | 'transfer_in' | 'adjustment';
 export interface StockMove {
   id: string;
   date: string;
@@ -209,7 +211,7 @@ export interface Reservation {
   productId: string;
   customerId: string;
   qty: number;
-  source: 'hold' | 'invoice';
+  source: 'hold' | 'invoice' | 'sales_order';
   sourceId?: string;
   status: 'Active' | 'Released' | 'Fulfilled';
   expires?: string;
@@ -259,16 +261,45 @@ export interface Payment {
   date: string;
   method: string;
 }
-export interface Allocation {
+export interface Pick {
   batchId: string;
-  code: string;
   warehouseId: string;
-  productId: string;
+  lotCode: string;
+  expiry: string;
   qty: number;
   cost: number;
 }
+export interface DeliveryLine extends Line {
+  id: string;
+  orderLineId?: string;
+  picks: Pick[];
+}
+export interface Delivery {
+  id: string;
+  number: string;
+  customerId: string;
+  orderId?: string;
+  method: 'delivery' | 'pickup';
+  status: 'Picking' | 'Dispatched' | 'Delivered' | 'Returned' | 'Cancelled';
+  warehouseId?: string;
+  address: string;
+  lines: DeliveryLine[];
+  cost: number;
+  date?: string;
+  driver: string;
+  receivedBy: string;
+  returnReason: string;
+  invoiceId?: string;
+  legacy?: true;
+  createdAt: string;
+  createdBy: string;
+  dispatchedAt?: string;
+  dispatchedBy?: string;
+  deliveredAt?: string;
+}
 export interface Invoice extends Totals {
-  creditOverride?: { by: string; at: string; reason: string; reasons: string[] };
+  orderId?: string;
+  creditOverride?: CreditOverride;
   allowShortDated: boolean;
   id: string;
   number: string;
@@ -278,10 +309,9 @@ export interface Invoice extends Totals {
   lines: Line[];
   status: 'Draft' | 'Issued';
   paid: number;
-  payments: Payment[];
-  allocations: Allocation[];
+  credited: number;
+  deliveryIds: string[];
   notes: string;
-  cogs?: number;
 }
 export interface Purchase {
   id: string;
@@ -351,7 +381,7 @@ export interface Settings {
   expiryWindow: number;
 }
 export interface Workspace {
-  version: 2;
+  version: 3;
   createdAt: string;
   settings: Settings;
   counters: {
@@ -362,6 +392,10 @@ export interface Workspace {
     count: number;
     recall: number;
     reservation: number;
+    order: number;
+    delivery: number;
+    creditNote: number;
+    payment: number;
   };
   products: Product[];
   batches: Batch[];
@@ -381,6 +415,59 @@ export interface Workspace {
   recalls: Recall[];
   reorderRules: ReorderRule[];
   reservations: Reservation[];
+  orders: SalesOrder[];
+  deliveries: Delivery[];
+  creditNotes: CreditNote[];
+  payments: CustomerPayment[];
+  refunds: Refund[];
+}
+export interface CreditOverride {
+  by: string;
+  at: string;
+  reason: string;
+  reasons: string[];
+}
+export interface OrderLine extends Line {
+  id: string;
+  cancelledQty: number;
+}
+export interface SalesOrder {
+  id: string;
+  number: string;
+  customerId: string;
+  status: 'Quote' | 'Confirmed' | 'Done' | 'Cancelled';
+  date: string;
+  validUntil?: string;
+  requestedDate: string;
+  fulfilment: 'delivery' | 'pickup';
+  deliveryAddress: string;
+  lines: OrderLine[];
+  discountPercent: number;
+  taxRate: number;
+  allowShortDated: boolean;
+  notes: string;
+  creditOverride?: CreditOverride;
+  cancelReason?: string;
+  createdAt: string;
+  createdBy: string;
+  confirmedAt?: string;
+  confirmedBy?: string;
+  closedAt?: string;
+}
+export interface OrderInput {
+  customerId: string;
+  date: string;
+  validUntil?: string;
+  requestedDate: string;
+  fulfilment: 'delivery' | 'pickup';
+  deliveryAddress?: string;
+  lines: (LineInput & { id?: string })[];
+  discountPercent?: NumericInput;
+  taxRate?: NumericInput;
+  allowShortDated?: boolean;
+  notes?: string;
+  asQuote?: boolean;
+  override?: { reason: string };
 }
 export type NumericInput = number | string;
 export interface AdjustmentInput {
@@ -403,7 +490,8 @@ export type PackInput = Omit<Pack, 'id' | 'factor' | 'price'> & {
   factor: NumericInput;
   price?: NumericInput;
 };
-type PharmaFields = Pick<
+type Fields<T, K extends keyof T> = { [P in K]: T[P] };
+type PharmaFields = Fields<
   Product,
   | 'registrationNo'
   | 'manufacturer'
@@ -425,7 +513,7 @@ export type ProductInput = Omit<
     reorder: NumericInput;
     packs?: PackInput[];
   };
-type CustomerAccountFields = Pick<Contact, 'groupId' | 'onHold' | 'holdReason' | 'billing'>;
+type CustomerAccountFields = Fields<Contact, 'groupId' | 'onHold' | 'holdReason' | 'billing'>;
 export type ContactInput = Omit<
   Contact,
   'id' | 'minShelfLifeDays' | 'paymentTermsDays' | 'creditLimit' | keyof CustomerAccountFields
@@ -468,8 +556,8 @@ export interface PurchaseInput {
   lines: LineInput[];
   notes?: string;
 }
-export type PurchaseInitial = Pick<PurchaseInput, 'supplierId' | 'warehouseId' | 'lines'>;
-export type InvoiceInitial = Pick<InvoiceInput, 'customerId' | 'lines' | 'fromHoldIds'>;
+export type PurchaseInitial = Fields<PurchaseInput, 'supplierId' | 'warehouseId' | 'lines'>;
+export type InvoiceInitial = Fields<InvoiceInput, 'customerId' | 'lines' | 'fromHoldIds'>;
 export interface ExpenseInput {
   amount: NumericInput;
   date: string;
@@ -478,3 +566,126 @@ export interface ExpenseInput {
   reference?: string;
 }
 export type Balances = Record<AccountId, { debit: number; credit: number; balance: number }>;
+
+export type CreditReason =
+  | 'wrong_prescription'
+  | 'wrong_item'
+  | 'damaged'
+  | 'expired'
+  | 'not_ordered'
+  | 'price_error'
+  | 'other';
+export interface ReturnPick {
+  batchId: string;
+  warehouseId: string;
+  lotCode: string;
+  qty: number;
+  cost: number;
+  returnBatchId?: string;
+}
+export interface CreditNoteLine extends Line {
+  invoiceLineIndex: number;
+  returns: ReturnPick[];
+}
+export interface CreditNote extends Totals {
+  id: string;
+  number: string;
+  invoiceId: string;
+  customerId: string;
+  date: string;
+  kind: 'return' | 'correction';
+  reason: CreditReason;
+  note: string;
+  lines: CreditNoteLine[];
+  returnCost: number;
+  settlement: 'refund' | 'credit';
+  refundMethod: string;
+  allocations: PaymentAllocation[];
+  refunded: number;
+  status: 'Draft' | 'Issued';
+  createdAt: string;
+  createdBy: string;
+  issuedAt?: string;
+}
+export interface CreditNoteInput {
+  invoiceId: string;
+  kind: CreditNote['kind'];
+  reason: CreditReason;
+  note?: string;
+  date?: string;
+  settlement: CreditNote['settlement'];
+  refundMethod?: string;
+  lines: {
+    invoiceLineIndex: number;
+    qty: NumericInput;
+    price?: NumericInput;
+    returns?: { batchId: string; qty: NumericInput }[];
+  }[];
+}
+
+export interface PaymentAllocation {
+  invoiceId: string;
+  amount: number;
+  date: string;
+}
+export interface AgingRow {
+  customerId: string;
+  current: number;
+  d1_30: number;
+  d31_60: number;
+  d61_90: number;
+  d90plus: number;
+  credit: number;
+  total: number;
+}
+export interface Statement {
+  opening: number;
+  lines: Array<{
+    date: string;
+    type: 'Invoice' | 'Payment' | 'Payment voided' | 'Credit note' | 'Refund';
+    reference: string;
+    description: string;
+    debit: number;
+    credit: number;
+    balance: number;
+  }>;
+  closing: number;
+  aging: AgingRow;
+}
+export interface CustomerPayment {
+  id: string;
+  number: string;
+  customerId: string;
+  date: string;
+  amount: number;
+  method: 'Bank transfer' | 'Cash' | 'Card' | 'Cheque' | 'Other';
+  reference: string;
+  note: string;
+  allocations: PaymentAllocation[];
+  voidedAllocations: PaymentAllocation[];
+  refunded: number;
+  status: 'Posted' | 'Voided';
+  voidReason: string;
+  voidDate: string;
+  legacy?: true;
+  createdAt: string;
+  createdBy: string;
+}
+export interface Refund {
+  id: string;
+  date: string;
+  customerId: string;
+  amount: number;
+  method: string;
+  from: { kind: 'payment' | 'credit_note'; id: string; amount: number }[];
+  createdBy: string;
+}
+export interface CustomerPaymentInput {
+  customerId: string;
+  date: string;
+  amount: NumericInput;
+  method: CustomerPayment['method'];
+  reference?: string;
+  note?: string;
+  allocations?: { invoiceId: string; amount: NumericInput }[];
+}

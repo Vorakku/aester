@@ -1,3 +1,6 @@
+import { CustomerStatement } from './receivables';
+import { CustomerPaymentForm, PaymentDetail, RefundCreditForm } from './payments';
+import { CreditNoteForm, CreditNoteDetail } from './creditNotes';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useWorkspace, type Dialog } from '../context/WorkspaceContext';
@@ -28,6 +31,9 @@ import { MovementTable } from '../pages/Operations';
 import { AddCountLotForm, CountReview, CountSheet, StartCountForm } from './stockCounts';
 import { RecallForm, RecallDetail } from './recalls';
 import { HoldStockForm, ReservationAlerts } from './reservations';
+import { DeliveryDetail, DeliveryForm, DeliveryPicksForm } from './deliveries';
+import { OrderDetail } from './orders';
+import { BillingAttention, InvoiceHeaderForm } from './invoicing';
 
 function SearchDialog() {
   const { state, open } = useWorkspace();
@@ -144,6 +150,7 @@ function StockAlerts() {
           </p>
         </div>
       </div>
+      <BillingAttention />
       {recalls.map((r) => (
         <div className="notification-item" key={r.id}>
           <span className="activity-icon red">
@@ -230,14 +237,27 @@ function DialogContents({ dialog }: { dialog: Dialog }) {
     'count-review': <CountReview id={id} />,
     'add-count-lot': <AddCountLotForm id={id} />,
     'hold-stock': <HoldStockForm id={id} />,
-    'invoice-form': (
+    'invoice-form': state.invoices.find((i) => i.id === id)?.deliveryIds.length ? (
+      <InvoiceHeaderForm id={id} />
+    ) : (
       <TransactionForm
         id={id || undefined}
         initial={'initial' in dialog ? dialog.initial : undefined}
       />
     ),
+    'invoice-header': <InvoiceHeaderForm id={id} />,
     'invoice-detail': <InvoiceDetail id={id} />,
-    'invoice-payment': <PaymentForm id={id} />,
+    'credit-note-form': <CreditNoteForm id={id} />,
+    'credit-note-detail': <CreditNoteDetail id={id} />,
+    'order-form': <TransactionForm order id={id || undefined} />,
+    'new-order': <TransactionForm order asQuote={false} />,
+    'order-detail': <OrderDetail id={id} />,
+    'delivery-form': <DeliveryForm id={id} />,
+    'delivery-detail': <DeliveryDetail id={id} />,
+    'delivery-picks': <DeliveryPicksForm id={id} />,
+    'invoice-payment': <CustomerPaymentForm id={id} />,
+    'payment-detail': <PaymentDetail id={id} />,
+    'refund-credit': <RefundCreditForm id={id} />,
     'bill-payment': <PaymentForm id={id} bill />,
     'purchase-form': (
       <TransactionForm purchase initial={'initial' in dialog ? dialog.initial : undefined} />
@@ -246,6 +266,9 @@ function DialogContents({ dialog }: { dialog: Dialog }) {
     'purchase-receive': <PurchaseReceiveForm id={id} />,
     'expense-form': <ExpenseForm />,
     'contact-form': <ContactForm id={id || undefined} />,
+    'customer-statement': (
+      <CustomerStatement id={id} asOf={'asOf' in dialog ? dialog.asOf : undefined} />
+    ),
     'contact-detail': <ContactDetail id={id} />,
     'contact-hold': <ContactHoldForm id={id} />,
     help: <HelpContent />,
@@ -297,6 +320,21 @@ export function DialogHost() {
   if (!dialog) return null;
   const id = 'id' in dialog ? dialog.id || '' : '';
   const titles: Record<Exclude<Dialog['kind'], 'confirm'>, [string, string]> = {
+    'order-form': [
+      id ? 'Edit order' : 'New quotation',
+      'Price an offer and reserve stock when confirmed.',
+    ],
+    'delivery-form': ['Create delivery', 'Choose quantities and a warehouse.'],
+    'delivery-detail': [
+      state.deliveries.find((d) => d.id === id)?.number || 'Delivery',
+      'Lots, dispatch and receipt.',
+    ],
+    'delivery-picks': ['Change lot', 'Choose eligible lots in expiry order.'],
+    'new-order': ['New order', 'Confirm an order and reserve available stock.'],
+    'order-detail': [
+      state.orders.find((o) => o.id === id)?.number || 'Order',
+      'Quotation and sales order details.',
+    ],
     'product-form': [
       id ? 'Edit product' : 'Add a product',
       'Build your catalog. Receive batches separately to add stock.',
@@ -322,10 +360,18 @@ export function DialogHost() {
       id ? 'Edit draft invoice' : 'Create an invoice',
       'Review, issue, and receive payment in one connected flow.',
     ],
+    'invoice-header': ['Edit invoice header', 'Lines come from delivery notes.'],
     'invoice-detail': [
       state.invoices.find((i) => i.id === id)?.number || 'Invoice',
       A.contact(state, state.invoices.find((i) => i.id === id)?.customerId || '')?.name || '',
     ],
+    'credit-note-form': ['Credit note / return', 'Correct an invoice and settle the credit.'],
+    'credit-note-detail': [
+      state.creditNotes.find((cn) => cn.id === id)?.number || 'Credit note',
+      'Return and correction details.',
+    ],
+    'payment-detail': ['Payment detail', 'Allocations, receipt and void history.'],
+    'refund-credit': ['Refund credit', 'Return available credit to the customer.'],
     'invoice-payment': ['Record a payment', 'Keep your customer balances up to date.'],
     'bill-payment': ['Pay supplier bill', 'Record a payment against the outstanding balance.'],
     'purchase-form': ['New purchase order', 'Plan incoming stock and track its delivery.'],
@@ -342,6 +388,7 @@ export function DialogHost() {
       id ? 'Edit contact' : 'Add a contact',
       'Keep customers and suppliers close at hand.',
     ],
+    'customer-statement': ['Customer statement', A.contact(state, id)?.name || ''],
     'contact-detail': [A.contact(state, id)?.name || 'Contact', A.contact(state, id)?.type || ''],
     'contact-hold': [
       A.contact(state, id)?.onHold ? 'Release hold' : 'Put on hold',
@@ -354,6 +401,8 @@ export function DialogHost() {
   };
   const [title, subtitle] = dialog.kind === 'confirm' ? [dialog.title, ''] : titles[dialog.kind];
   const drawer = [
+    'delivery-detail',
+    'order-detail',
     'product-detail',
     'batch-detail',
     'recall-detail',
@@ -361,6 +410,15 @@ export function DialogHost() {
     'alerts',
   ].includes(dialog.kind);
   const large = [
+    'customer-statement',
+    'credit-note-form',
+    'credit-note-detail',
+    'delivery-form',
+    'delivery-detail',
+    'delivery-picks',
+    'order-form',
+    'new-order',
+    'order-detail',
     'invoice-form',
     'invoice-detail',
     'purchase-form',

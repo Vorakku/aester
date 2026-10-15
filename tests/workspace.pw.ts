@@ -6,6 +6,392 @@ async function saved(page: Page) {
   );
 }
 
+test('invalid mutation results show an internal-check toast and preserve the saved workspace', async ({
+  page,
+}) => {
+  await page.goto('/#contacts');
+  const dialog = page.getByRole('dialog');
+  await page.getByRole('button', { name: 'Add contact', exact: true }).click();
+  await dialog.getByLabel('Business / contact name').fill('Before internal check');
+  await dialog.getByRole('button', { name: 'Save contact', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  const before = await page.evaluate(() => localStorage.getItem('aster_pharmacy_workspace_v1'));
+  const beforeState = await saved(page);
+
+  // Inject a bad operation result through the real UI and WorkspaceContext.mutate path.
+  await page.evaluate(async () => {
+    const path = '/src/lib/model.ts';
+    const { A } = (await import(/* @vite-ignore */ path)) as typeof import('../src/lib/model');
+    const saveContact = A.saveContact;
+    A.saveContact = (s, data, id) => {
+      A.saveContact = saveContact;
+      const result = saveContact(s, data, id);
+      Object.assign(s, { version: 0 });
+      return result;
+    };
+  });
+  await page.getByRole('button', { name: 'Add contact', exact: true }).click();
+  await dialog.getByLabel('Business / contact name').fill('Rejected internal check');
+  await dialog.getByRole('button', { name: 'Save contact', exact: true }).click();
+  await expect(page.locator('#toast-root .toast.error')).toContainText(
+    'Internal check failed: This is not a supported Aster backup.',
+  );
+  await expect(dialog).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem('aster_pharmacy_workspace_v1'))).toBe(
+    before,
+  );
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  await expect(page.getByRole('row').filter({ hasText: 'Rejected internal check' })).toHaveCount(0);
+
+  // The next valid save must start from the previous state, including its ref.
+  await page.getByRole('button', { name: 'Add contact', exact: true }).click();
+  await dialog.getByLabel('Business / contact name').fill('After internal check');
+  await dialog.getByRole('button', { name: 'Save contact', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  const after = await saved(page);
+  expect(after.version).toBe(beforeState.version);
+  expect(after.contacts).toHaveLength(beforeState.contacts.length + 1);
+  expect(after.contacts.some((c: { name: string }) => c.name === 'Rejected internal check')).toBe(
+    false,
+  );
+  await page.reload();
+  expect(await saved(page)).toEqual(after);
+  expect(await page.evaluate(() => localStorage.getItem('aster_pharmacy_recovery'))).toBeNull();
+});
+
+test('cancelling the remainder keeps a picking delivery dispatchable and closes the order on dispatch', async ({
+  page,
+}) => {
+  await page.goto('/#orders');
+  const dialog = page.getByRole('dialog');
+  await page.getByRole('button', { name: 'New order', exact: true }).click();
+  await dialog.getByLabel('Customer', { exact: false }).selectOption('c5');
+  await dialog.getByLabel('Line product', { exact: true }).selectOption('p3');
+  await dialog.getByLabel('Line quantity', { exact: true }).fill('5');
+  await dialog.getByRole('button', { name: 'Save & confirm order', exact: true }).click();
+  const order = (await saved(page)).orders[0];
+  await dialog.getByRole('button', { name: 'Create delivery', exact: true }).click();
+  await dialog.getByLabel('Warehouse', { exact: false }).selectOption('wh_main');
+  await dialog.getByRole('button', { name: 'Create delivery', exact: true }).click();
+  const delivery = (await saved(page)).deliveries[0];
+  expect(delivery.lines[0].qty).toBe(5);
+  await dialog.getByRole('button', { name: order.number, exact: true }).click();
+  await dialog.getByRole('button', { name: 'Cancel remaining', exact: true }).last().click();
+  await dialog
+    .getByLabel('Cancellation reason')
+    .fill('Only the goods already being picked are needed');
+  await dialog.getByRole('button', { name: 'Confirm cancellation', exact: true }).click();
+  expect((await saved(page)).orders.find((o: { id: string }) => o.id === order.id)).toMatchObject({
+    status: 'Confirmed',
+    lines: [{ cancelledQty: 0 }],
+  });
+  await dialog.getByRole('button', { name: `${delivery.number} Picking`, exact: true }).click();
+  await dialog.getByRole('button', { name: 'Dispatch', exact: true }).click();
+  await dialog.getByLabel('Driver name').fill('Dara');
+  await dialog.getByRole('button', { name: 'Dispatch goods', exact: true }).click();
+  const after = await saved(page);
+  expect(after.deliveries.find((d: { id: string }) => d.id === delivery.id).status).toBe(
+    'Dispatched',
+  );
+  expect(after.orders.find((o: { id: string }) => o.id === order.id).status).toBe('Done');
+  await page.reload();
+  expect((await saved(page)).orders.find((o: { id: string }) => o.id === order.id).status).toBe(
+    'Done',
+  );
+});
+
+test('receivables at a past date reconcile with a printable customer statement', async ({
+  page,
+}) => {
+  await page.goto('/#dashboard');
+  await page.getByRole('button', { name: 'View receivables aging', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Receivables', exact: true })).toBeVisible();
+  const asOf = await page.evaluate(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 30);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  });
+  await page.getByLabel('As of', { exact: true }).fill(asOf);
+  const customerName = await page
+    .locator('main table tbody')
+    .getByRole('button')
+    .first()
+    .innerText();
+  const row = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('button', { name: customerName, exact: true }) });
+  const agingTotal = await row.getByRole('cell').last().innerText();
+  const exportDownload = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export CSV', exact: true }).click();
+  expect((await exportDownload).suggestedFilename()).toBe(`aster-aging-${asOf}.csv`);
+  await row.getByRole('button', { name: customerName, exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByLabel('To', { exact: true })).toHaveValue(asOf);
+  await expect(dialog.getByTestId('statement-closing')).toHaveText(agingTotal);
+  await expect(dialog.getByTestId('statement-aging-total')).toHaveText(agingTotal);
+  await expect(dialog.locator('#print-document')).toContainText('CUSTOMER STATEMENT');
+  await expect(dialog.locator('#print-document')).toContainText(customerName);
+  const statementDownload = page.waitForEvent('download');
+  await dialog.getByRole('button', { name: 'Export CSV', exact: true }).click();
+  expect((await statementDownload).suggestedFilename()).toContain('aster-statement-');
+  await page.evaluate(() => {
+    window.print = () => {
+      document.body.dataset.printed = 'true';
+    };
+  });
+  await dialog.getByRole('button', { name: 'Print', exact: true }).click();
+  await expect(page.locator('body')).toHaveAttribute('data-printed', 'true');
+  await page.emulateMedia({ media: 'print' });
+  await expect(dialog.locator('#print-document')).toBeVisible();
+  await expect(dialog.getByTestId('statement-closing')).toBeVisible();
+  await expect(dialog.getByTestId('statement-aging-total')).toBeVisible();
+  await page.emulateMedia({ media: 'screen' });
+});
+
+test('a paid invoice return is refunded, quarantined in its original lot, and released in Batches', async ({
+  page,
+}) => {
+  await page.goto('/#invoices');
+  const dialog = page.getByRole('dialog');
+  await page.getByRole('button', { name: 'New invoice', exact: true }).click();
+  await dialog.getByLabel('Customer', { exact: false }).selectOption('c5');
+  await dialog.getByLabel('Line product', { exact: true }).selectOption('p3');
+  await dialog.getByLabel('Line quantity', { exact: true }).fill('2');
+  await dialog.getByRole('button', { name: 'Issue invoice', exact: true }).click();
+  const invoice = (await saved(page)).invoices[0];
+  await dialog.getByRole('button', { name: 'Record payment', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Record payment', exact: true }).click();
+  await page.getByPlaceholder('Search invoice or customer...').fill(invoice.number);
+  await page.getByRole('button', { name: invoice.number, exact: true }).click();
+  await dialog.getByRole('button', { name: 'Credit note / return', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Return goods', exact: true }).click();
+  await dialog.getByLabel('Reason', { exact: false }).selectOption('wrong_prescription');
+  await dialog.getByLabel('Qty to credit 1', { exact: false }).fill('1');
+  await dialog.getByRole('radio', { name: 'Refund', exact: true }).check();
+  await dialog.getByLabel('Refund method').selectOption('Cash');
+  await expect(
+    dialog.getByText(`Reduces ${invoice.number}'s balance by $0.00.`, { exact: false }),
+  ).toBeVisible();
+  await dialog.getByRole('button', { name: 'Issue credit note', exact: true }).click();
+  await expect(dialog.locator('#print-document')).toContainText('CREDIT NOTE');
+  await expect(dialog.locator('#print-document')).toContainText(invoice.number);
+  const returned = await saved(page);
+  const cn = returned.creditNotes[0];
+  expect(cn.status).toBe('Issued');
+  expect(cn.reason).toBe('wrong_prescription');
+  expect(cn.refunded).toBe(cn.total);
+  const pick = cn.lines[0].returns[0];
+  const original = returned.batches.find((b: { id: string }) => b.id === pick.batchId);
+  const twin = returned.batches.find((b: { id: string }) => b.id === pick.returnBatchId);
+  expect(twin).toMatchObject({
+    code: original.code,
+    expiry: original.expiry,
+    cost: original.cost,
+    warehouseId: original.warehouseId,
+    quarantined: true,
+  });
+  await page.emulateMedia({ media: 'print' });
+  await expect(dialog.locator('#print-document')).toBeVisible();
+  await page.emulateMedia({ media: 'screen' });
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  await page.getByRole('button', { name: /Batches & expiry/ }).click();
+  await page.getByLabel('Batch status').selectOption('Quarantined');
+  await page.getByPlaceholder('Search product or batch number...').fill(twin.code);
+  const row = page
+    .getByRole('row')
+    .filter({ hasText: twin.code })
+    .filter({ hasText: 'Returned' })
+    .first();
+  await expect(row.getByText('Returned', { exact: true })).toBeVisible();
+  await row.getByRole('button').first().click();
+  await dialog.getByRole('button', { name: 'Release batch', exact: true }).click();
+  expect(
+    (await saved(page)).batches.find((b: { id: string }) => b.id === twin.id).quarantined,
+  ).toBe(false);
+  await page.reload();
+  expect((await saved(page)).creditNotes.find((c: { id: string }) => c.id === cn.id).refunded).toBe(
+    cn.total,
+  );
+});
+
+test('two deliveries of one customer are invoiced together and leave To invoice', async ({
+  page,
+}) => {
+  await page.goto('/#orders');
+  const dialog = page.getByRole('dialog');
+  await page.getByRole('button', { name: 'New order', exact: true }).click();
+  await dialog.getByLabel('Customer', { exact: false }).selectOption('c5');
+  await dialog.getByLabel('Line product', { exact: true }).selectOption('p3');
+  await dialog.getByLabel('Line quantity', { exact: true }).fill('1');
+  await dialog.getByRole('button', { name: 'Save & confirm order', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Create delivery', exact: true }).click();
+  await dialog.getByLabel('Warehouse', { exact: false }).selectOption('wh_main');
+  await dialog.getByRole('button', { name: 'Create delivery', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Dispatch', exact: true }).click();
+  await dialog.getByLabel('Driver name').fill('Dara');
+  await dialog.getByRole('button', { name: 'Dispatch goods', exact: true }).click();
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  await page.getByRole('button', { name: 'Invoices', exact: true }).click();
+  await page.getByRole('tab', { name: 'To invoice', exact: true }).click();
+  const group = page.getByRole('region', { name: 'To invoice: Sunrise Hospital', exact: true });
+  const choices = group.getByRole('checkbox');
+  await expect(choices).toHaveCount(2);
+  const labels = await choices.evaluateAll((elements) =>
+    elements.map((e) => e.getAttribute('aria-label')!.replace('Select ', '')),
+  );
+  await choices.nth(0).check();
+  await choices.nth(1).check();
+  await group.getByRole('button', { name: 'Create invoice', exact: true }).click();
+  await expect(
+    dialog.getByText("Lines come from delivery notes and can't be edited.", { exact: true }),
+  ).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Reserve stock', exact: true })).toHaveCount(0);
+  for (const dn of labels)
+    await expect(dialog.getByRole('button', { name: dn, exact: true })).toBeVisible();
+  const drafted = await saved(page);
+  const invoice = drafted.invoices[0];
+  expect(invoice.deliveryIds).toHaveLength(2);
+  await dialog.getByRole('button', { name: 'Issue invoice', exact: true }).click();
+  await expect(dialog.getByRole('button', { name: 'Record payment', exact: true })).toBeVisible();
+  const issued = await saved(page);
+  expect(issued.invoices.find((i: { id: string }) => i.id === invoice.id).status).toBe('Issued');
+  expect(issued.stockMoves).toEqual(drafted.stockMoves);
+  for (const id of invoice.deliveryIds)
+    expect(issued.deliveries.find((d: { id: string }) => d.id === id).invoiceId).toBe(invoice.id);
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  for (const dn of labels)
+    await expect(page.getByRole('button', { name: dn, exact: true })).toHaveCount(0);
+  await page.reload();
+  await page.getByRole('tab', { name: 'To invoice', exact: true }).click();
+  for (const dn of labels)
+    await expect(page.getByRole('button', { name: dn, exact: true })).toHaveCount(0);
+});
+
+test('an order is picked with an edited lot, dispatched, delivered and traceable by DN', async ({
+  page,
+}) => {
+  await page.goto('/#inventory');
+  // Ensure an alternative clean lot, regardless of the lot selected for the sample recall.
+  await page.getByRole('button', { name: 'Receive stock', exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Product', { exact: false }).selectOption('p1');
+  await dialog.getByLabel('Warehouse', { exact: false }).selectOption('wh_main');
+  await dialog.getByLabel('Quantity (boxes)', { exact: false }).fill('20');
+  await dialog.getByLabel('Unit cost', { exact: false }).fill('2');
+  await dialog.getByLabel('Batch / lot number').fill('DELIVERY-E2E');
+  await dialog.getByLabel('Expiry date').fill('2030-12-31');
+  await dialog.getByRole('button', { name: 'Receive stock', exact: true }).click();
+  await page.getByRole('button', { name: 'Orders', exact: true }).click();
+  await page.getByRole('button', { name: 'New order', exact: true }).click();
+  await dialog.getByLabel('Customer', { exact: false }).selectOption('c1');
+  await dialog.getByLabel('Line product', { exact: true }).selectOption('p1');
+  await dialog.getByLabel('Line quantity', { exact: true }).fill('4');
+  await dialog.getByRole('button', { name: 'Save & confirm order', exact: true }).click();
+  const order = (await saved(page)).orders[0];
+  await dialog.getByRole('button', { name: 'Create delivery', exact: true }).click();
+  await dialog.getByLabel('Warehouse', { exact: false }).selectOption('wh_main');
+  await dialog.getByLabel('Method', { exact: false }).selectOption('delivery');
+  await dialog.getByRole('button', { name: 'Create delivery', exact: true }).click();
+  const delivery = (await saved(page)).deliveries[0];
+  await dialog.getByRole('button', { name: 'Change lot', exact: true }).click();
+  const quantities = dialog.getByRole('spinbutton');
+  for (const input of await quantities.all()) await input.fill('0');
+  await dialog.getByLabel('Pick DELIVERY-E2E', { exact: false }).fill('4');
+  await dialog.getByRole('button', { name: 'Save picks', exact: true }).click();
+  await expect(dialog.getByText('DELIVERY-E2E', { exact: true }).first()).toBeVisible();
+  await dialog.getByRole('button', { name: 'Dispatch', exact: true }).click();
+  await dialog.getByLabel('Driver name').fill('Dara');
+  await dialog.getByRole('button', { name: 'Dispatch goods', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Confirm delivered', exact: true }).click();
+  await dialog.getByLabel('Received by').fill('Greenlife receiving desk');
+  await dialog.getByRole('button', { name: 'Confirm receipt', exact: true }).click();
+  await expect(dialog.getByText('Delivered', { exact: true }).first()).toBeVisible();
+  await page.emulateMedia({ media: 'print' });
+  const note = dialog.locator('#print-document');
+  await expect(note).toBeVisible();
+  await expect(note).toContainText('DELIVERY NOTE');
+  await expect(note).toContainText('DELIVERY-E2E');
+  await expect(note).toContainText('signature');
+  await expect(note).not.toContainText('Price');
+  await page.emulateMedia({ media: 'screen' });
+  await dialog.getByRole('button', { name: order.number, exact: true }).click();
+  await expect(dialog.getByText('Delivered', { exact: true }).first()).toBeVisible();
+  await expect(
+    dialog.locator('tbody tr').filter({ hasText: 'Paracetamol 500mg' }).first(),
+  ).toContainText('4');
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  await page.getByRole('button', { name: 'Deliveries', exact: true }).click();
+  await page.getByRole('tab', { name: 'Delivered', exact: true }).click();
+  await expect(page.getByRole('button', { name: delivery.number, exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Warehouses', exact: true }).click();
+  await page.getByLabel('Movement type').selectOption('sale');
+  await expect(page.locator('tbody tr').filter({ hasText: delivery.number })).toContainText(
+    'DELIVERY-E2E',
+  );
+  const state = await saved(page);
+  expect(state.orders.find((o: { id: string }) => o.id === order.id).status).toBe('Done');
+  expect(state.deliveries.find((d: { id: string }) => d.id === delivery.id)).toMatchObject({
+    status: 'Delivered',
+    lines: [{ picks: [{ lotCode: 'DELIVERY-E2E', qty: 4 }] }],
+  });
+  await page.reload();
+  expect(
+    (await saved(page)).deliveries.find((d: { id: string }) => d.id === delivery.id).status,
+  ).toBe('Delivered');
+});
+
+test('a quotation confirms, reserves stock in product detail and closes after cancelling the remainder', async ({
+  page,
+}) => {
+  await page.goto('/#orders');
+  await page.getByRole('button', { name: 'New quotation', exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Customer', { exact: false }).selectOption('c1');
+  await dialog.getByLabel('Line product', { exact: true }).selectOption('p1');
+  await expect(dialog.getByLabel('Line unit price', { exact: true })).toHaveValue('5.1');
+  await expect(dialog.getByText('Special', { exact: true })).toBeVisible();
+  await dialog.getByLabel('Line quantity', { exact: true }).fill('4');
+  await dialog.getByRole('button', { name: 'Save quotation', exact: true }).click();
+  let state = await saved(page);
+  const order = state.orders[0];
+  expect(order).toMatchObject({
+    status: 'Quote',
+    customerId: 'c1',
+    lines: [{ productId: 'p1', qty: 4, price: 5.1, cancelledQty: 0 }],
+  });
+  await page.emulateMedia({ media: 'print' });
+  await expect(dialog.locator('#print-document')).toBeVisible();
+  await expect(dialog.locator('#print-document')).toContainText('QUOTATION');
+  await page.emulateMedia({ media: 'screen' });
+  await dialog.getByRole('button', { name: 'Confirm', exact: true }).click();
+  await expect(dialog.getByRole('button', { name: 'Create delivery', exact: true })).toBeEnabled();
+  state = await saved(page);
+  expect(state.orders[0].status).toBe('Confirmed');
+  const reservation = state.reservations.find((r: { sourceId: string }) => r.sourceId === order.id);
+  expect(reservation).toMatchObject({
+    source: 'sales_order',
+    productId: 'p1',
+    qty: 4,
+    status: 'Active',
+  });
+  await dialog.getByRole('button', { name: 'Paracetamol 500mg', exact: true }).click();
+  const row = dialog.locator('tbody tr').filter({ hasText: reservation.number });
+  await expect(row).toContainText('4 boxes');
+  await expect(row).toContainText('Active');
+  await row.getByRole('button', { name: order.number, exact: true }).click();
+  await dialog.getByRole('button', { name: 'Cancel remaining', exact: true }).last().click();
+  await dialog.getByLabel('Cancellation reason').fill('Customer cancelled the collection');
+  await dialog.getByRole('button', { name: 'Confirm cancellation', exact: true }).click();
+  await expect(dialog.getByText('Done', { exact: true }).first()).toBeVisible();
+  state = await saved(page);
+  expect(state.orders[0]).toMatchObject({ status: 'Done', lines: [{ cancelledQty: 4 }] });
+  expect(state.reservations.find((r: { id: string }) => r.id === reservation.id).status).toBe(
+    'Released',
+  );
+  await page.reload();
+  expect((await saved(page)).orders[0].status).toBe('Done');
+});
+
 test('Clinic price lists fill invoice lines and customer changes reprice defaults while preserving manual prices', async ({
   page,
 }) => {
@@ -695,6 +1081,11 @@ test('packaging, carton receipts, barcode sales, and mixed purchase units stay c
   await page.getByLabel('Line quantity', { exact: true }).nth(1).fill('10');
   await expect(page.getByRole('dialog').locator('.invoice-total')).toContainText('$230.00');
   await page.getByRole('button', { name: 'Issue invoice', exact: true }).click();
+  await expect(page.getByRole('dialog').getByRole('alert')).toContainText(
+    'Credit limit $3000.00 exceeded',
+  );
+  await page.getByLabel('Override reason').fill('Manager approved this carton sale.');
+  await page.getByRole('button', { name: 'Override and issue', exact: true }).click();
   await expect(page.getByRole('dialog').locator('#print-document')).toContainText('2 cartons');
   await expect(page.getByRole('dialog').locator('#print-document')).toContainText('10 boxes');
   state = await saved(page);
@@ -705,7 +1096,10 @@ test('packaging, carton receipts, barcode sales, and mixed purchase units stay c
     ['box', 1],
   ]);
   expect(
-    state.invoices[0].allocations.reduce((n: number, a: { qty: number }) => n + a.qty, 0),
+    state.deliveries
+      .filter((d: { id: string }) => state.invoices[0].deliveryIds.includes(d.id))
+      .flatMap((d: { lines: { picks: { qty: number }[] }[] }) => d.lines.flatMap((l) => l.picks))
+      .reduce((n: number, p: { qty: number }) => n + p.qty, 0),
   ).toBe(50);
   expect(state.batches.find((b: { code: string }) => b.code === 'PACK-RECEIPT').qty).toBe(10);
   await page.goto('/#purchasing');
@@ -909,7 +1303,10 @@ test('stock, invoices, payments, purchases, expenses, search, and backups remain
   ).toBeVisible();
   state = await saved(page);
   expect(state.batches.find((b: { code: string }) => b.code === 'REACT-BATCH').qty).toBe(22);
-  await page.getByRole('button', { name: 'Record payment', exact: true }).click();
+  await page
+    .getByRole('dialog')
+    .getByRole('button', { name: 'Record payment', exact: true })
+    .click();
   await page.getByLabel('Payment amount').fill('5');
   await page
     .getByRole('dialog')
@@ -1015,4 +1412,73 @@ test('mobile navigation, modal focus, and empty/reset flows work', async ({ page
   await page.getByRole('button', { name: 'Reset sample data' }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Restore samples' }).click();
   expect((await saved(page)).products.length).toBe(30);
+});
+
+test('one customer payment settles two invoices, keeps extra credit and applies it to the next invoice', async ({
+  page,
+}) => {
+  await page.goto('/#invoices');
+  const dialog = page.getByRole('dialog');
+  // A fresh customer makes the allocation list and available credit unambiguous.
+  await page.getByRole('button', { name: /Contacts/ }).click();
+  await page.getByRole('button', { name: 'Add contact', exact: true }).click();
+  await dialog.getByLabel('Business / contact name').fill('Payment allocation customer');
+  await dialog.getByRole('button', { name: 'Save contact', exact: true }).click();
+  const customerId = (await saved(page)).contacts.find(
+    (c: { name: string }) => c.name === 'Payment allocation customer',
+  ).id;
+  await page
+    .getByRole('button', { name: /Invoices/ })
+    .first()
+    .click();
+  const issued: { id: string; number: string; total: number }[] = [];
+  for (let n = 0; n < 2; n++) {
+    await page.getByRole('button', { name: 'New invoice', exact: true }).click();
+    await dialog.getByLabel('Customer', { exact: false }).selectOption(customerId);
+    await dialog.getByLabel('Line product', { exact: true }).selectOption('p3');
+    await dialog.getByLabel('Line quantity', { exact: true }).fill('1');
+    await dialog.getByRole('button', { name: 'Issue invoice', exact: true }).click();
+    issued.push((await saved(page)).invoices[0]);
+    await page.getByRole('button', { name: 'Close dialog' }).click();
+  }
+  await page.getByRole('button', { name: 'Record payment', exact: true }).click();
+  await dialog.getByLabel('Customer', { exact: false }).selectOption(customerId);
+  const extra = 2;
+  await dialog
+    .getByLabel('Payment amount ($)')
+    .fill(String(issued[0].total + issued[1].total + extra));
+  await dialog.getByLabel('Payment method').selectOption('Bank transfer');
+  await dialog.getByLabel('Reference').fill('TWO-INVOICES-007');
+  await expect(dialog.getByText('$2.00 kept as credit', { exact: false })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Record payment', exact: true }).click();
+  for (const invoice of issued) {
+    await page.getByPlaceholder('Search invoice or customer...').fill(invoice.number);
+    await expect(
+      page.getByRole('row').filter({ hasText: invoice.number }).getByText('Paid', { exact: true }),
+    ).toBeVisible();
+  }
+  await page.getByRole('tab', { name: 'Payments', exact: true }).click();
+  const paymentRow = page.getByRole('row').filter({ hasText: 'TWO-INVOICES-007' });
+  await expect(paymentRow).toContainText('$2.00');
+  await paymentRow.getByRole('button').click();
+  await expect(dialog.locator('#print-document')).toContainText('OFFICIAL RECEIPT');
+  await expect(dialog.locator('#print-document')).toContainText(issued[0].number);
+  await expect(dialog.locator('#print-document')).toContainText(issued[1].number);
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  await page.getByRole('button', { name: 'New invoice', exact: true }).click();
+  await dialog.getByLabel('Customer', { exact: false }).selectOption(customerId);
+  await dialog.getByLabel('Line product', { exact: true }).selectOption('p3');
+  await dialog.getByLabel('Line quantity', { exact: true }).fill('1');
+  await dialog.getByRole('button', { name: 'Issue invoice', exact: true }).click();
+  await expect(dialog.getByText('Payments & credits', { exact: true })).toBeVisible();
+  const result = await saved(page);
+  expect(result.invoices[0].paid).toBe(extra);
+  const payment = result.payments.find(
+    (p: { reference: string }) => p.reference === 'TWO-INVOICES-007',
+  );
+  expect(payment.allocations).toHaveLength(3);
+  expect(payment.allocations[2].invoiceId).toBe(result.invoices[0].id);
+  expect(payment.allocations[2].amount).toBe(extra);
+  await page.reload();
+  expect((await saved(page)).invoices[0].paid).toBe(extra);
 });

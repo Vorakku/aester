@@ -99,14 +99,17 @@ export function RecallDetail({ id }: { id: string }) {
       <h3 className="detail-label">Sold to</h3>
       <DataTable
         items={trace.sold}
-        columns={['Customer', 'Phone', 'Invoice', 'Date', 'Qty']}
+        columns={['Customer', 'Phone', 'Delivery', 'Invoice', 'Date', 'Qty', 'Returned']}
         row={(row) => (
-          <tr key={row.invoice}>
+          <tr key={row.delivery || row.invoice}>
             <td>{row.customerName}</td>
             <td>{row.phone}</td>
+            <td>{row.delivery || '—'}</td>
             <td>{row.invoice}</td>
             <td>{date(row.date)}</td>
             <td>{number(row.qty)}</td>
+            <td>{number(row.returned)}</td>
+            <td>{number(row.returned)}</td>
           </tr>
         )}
       />

@@ -1,4 +1,14 @@
 import type {
+  AgingRow,
+  Statement,
+  CustomerPayment,
+  CustomerPaymentInput,
+  PaymentAllocation,
+  Refund,
+  CreditNote,
+  CreditNoteInput,
+  CreditNoteLine,
+  CreditReason,
   NumericInput,
   Unit,
   AccountId,
@@ -18,7 +28,9 @@ import type {
   InvoiceInput,
   PurchaseInput,
   ExpenseInput,
-  Allocation,
+  Delivery,
+  DeliveryLine,
+  Pick as DeliveryPick,
   Balances,
   Shape,
   MoveType,
@@ -34,6 +46,9 @@ import type {
   ReorderRule,
   Suggestion,
   Reservation,
+  SalesOrder,
+  OrderInput,
+  CreditOverride,
 } from '../types';
 
 // ponytail: fake user until auth exists; replace with the session user
@@ -128,6 +143,11 @@ function inactiveReason(s: Workspace, id: string): string {
   return onHand(s, id) > 0 ||
     s.invoices.some((i) => i.status === 'Draft' && i.lines.some((l) => l.productId === id)) ||
     s.purchases.some((p) => p.status === 'Ordered' && p.lines.some((l) => l.productId === id)) ||
+    s.orders.some(
+      (o) =>
+        ['Quote', 'Confirmed'].includes(o.status) &&
+        o.lines.some((l) => l.productId === id && openQty(s, o, l.id) > 0),
+    ) ||
     reserved(s, id) > 0
     ? `${p.name} still has stock or open documents.`
     : '';
@@ -234,7 +254,7 @@ const contact = (s: Workspace, id: string) => s.contacts.find((x) => x.id === id
 const warehouse = (s: Workspace, id: string) => s.warehouses.find((x) => x.id === id);
 const baseUnitLocked = (s: Workspace, id: string) =>
   s.batches.some((b) => b.productId === id) ||
-  [...s.invoices, ...s.purchases].some((d) => d.lines.some((l) => l.productId === id));
+  [...s.invoices, ...s.purchases, ...s.orders].some((d) => d.lines.some((l) => l.productId === id));
 const unitLabel = (unit: Unit, qty = 2) =>
   qty === 1 ? unit : unit === 'box' ? 'boxes' : unit + 's';
 function unitFactor(p: Product, unit: Unit = p.unit): number {
@@ -565,13 +585,22 @@ function recallTrace(s: Workspace, recallId: string) {
     customerName: string;
     phone: string;
     invoice: string;
+    delivery: string;
     date: string;
     qty: number;
+    returned: number;
   }> = [];
   moves
     .filter((m) => m.type === 'sale')
     .forEach((m) => {
-      const existing = sold.find((row) => row.invoice === m.reference);
+      const delivery = s.deliveries.find(
+        (d) => d.id === m.sourceId || (d.legacy && d.invoiceId === m.sourceId),
+      );
+      const invoice = s.invoices.find((i) => i.id === delivery?.invoiceId || i.id === m.sourceId);
+      const invoiceNumber = invoice?.number || (delivery ? '—' : m.reference);
+      const existing = sold.find(
+        (row) => row.delivery === (delivery?.number || '') && row.invoice === invoiceNumber,
+      );
       if (existing) sold[sold.indexOf(existing)] = { ...existing, qty: existing.qty - m.qty };
       else {
         const customerId = m.counterpartyId || '',
@@ -580,9 +609,41 @@ function recallTrace(s: Workspace, recallId: string) {
           customerId,
           customerName: c?.name || 'Unknown customer',
           phone: c?.phone || '',
-          invoice: m.reference,
+          invoice: invoiceNumber,
+          delivery: delivery?.number || '',
           date: m.date,
           qty: -m.qty,
+          returned: 0,
+        });
+      }
+    });
+  moves
+    .filter((m) => m.type === 'return')
+    .forEach((m) => {
+      const cn = s.creditNotes.find((cn) => cn.id === m.sourceId);
+      const delivery = s.deliveries.find((d) => d.id === m.sourceId);
+      const invoiceId = cn?.invoiceId || delivery?.invoiceId;
+      const invoice = s.invoices.find((i) => i.id === invoiceId);
+      const rows = sold.filter((row) =>
+        invoice ? row.invoice === invoice.number : row.delivery === delivery?.number,
+      );
+      let remaining = m.qty;
+      for (const row of rows) {
+        const qty = Math.min(remaining, row.qty - row.returned);
+        row.returned += qty;
+        remaining -= qty;
+      }
+      if (remaining > 0) {
+        const customerId = m.counterpartyId || '';
+        sold.push({
+          customerId,
+          customerName: contact(s, customerId)?.name || 'Unknown customer',
+          phone: contact(s, customerId)?.phone || '',
+          invoice: invoice?.number || '\u2014',
+          delivery: delivery?.number || '',
+          date: m.date,
+          qty: 0,
+          returned: remaining,
         });
       }
     });
@@ -598,6 +659,10 @@ function recallTrace(s: Workspace, recallId: string) {
         (m) => m.qty,
       ),
       sold: sum(sold, (row) => row.qty),
+      returned: sum(
+        moves.filter((m) => m.type === 'return'),
+        (m) => m.qty,
+      ),
       adjusted: sum(
         moves.filter((m) => m.type === 'adjustment'),
         (m) => m.qty,
@@ -640,7 +705,7 @@ const reserved = (s: Workspace, productId: string, opts: { exceptSourceId?: stri
       (r) =>
         r.productId === productId &&
         reservationStatus(r) === 'Active' &&
-        (!opts.exceptSourceId || r.source !== 'invoice' || r.sourceId !== opts.exceptSourceId),
+        (!opts.exceptSourceId || r.sourceId !== opts.exceptSourceId),
     )
     .reduce((n, r) => n + r.qty, 0);
 const free = (
@@ -704,6 +769,10 @@ function holdStock(
 function reserveInvoice(s: Workspace, invoiceId: string): Reservation[] {
   const i = s.invoices.find((i) => i.id === invoiceId);
   required(i?.status === 'Draft', 'Only draft invoices can be reserved.');
+  required(
+    !i.deliveryIds.length,
+    'Delivery drafts cannot reserve stock. Their stock has already left.',
+  );
   required(
     !s.reservations.some(
       (r) => r.source === 'invoice' && r.sourceId === invoiceId && r.status === 'Active',
@@ -836,14 +905,17 @@ const productStatus = (s: Workspace, p: Product) =>
 const invoiceStatus = (i: Invoice) =>
   i.status === 'Draft'
     ? 'Draft'
-    : round(i.total - i.paid) <= 0
-      ? 'Paid'
+    : invoiceBalance(i) <= 0
+      ? i.credited > 0 && i.credited >= round(i.total - i.paid)
+        ? 'Credited'
+        : 'Paid'
       : daysLeft(i.due) < 0
         ? 'Overdue'
         : i.paid > 0
           ? 'Partial'
           : 'Unpaid';
-const invoiceBalance = (i: Invoice) => (i.status === 'Draft' ? 0 : round(i.total - i.paid));
+const invoiceBalance = (i: Invoice) =>
+  i.status === 'Draft' ? 0 : round(i.total - i.paid - i.credited);
 function ledger(
   s: Workspace,
   date: string,
@@ -1003,7 +1075,9 @@ function moveStock(
     `Lot ${batch.code} is under recall (${recall?.number}).`,
   );
   if (qty > 0) {
-    const p = activeProduct(s, batch.productId);
+    const p =
+      meta.type === 'return' ? product(s, batch.productId)! : activeProduct(s, batch.productId);
+    required(p, 'Product not found.');
     required(
       p.storage !== 'cold' || warehouse(s, batch.warehouseId)?.storage === 'cold',
       `${p.name} must be stored at 2–8°C. Choose a cold-storage warehouse.`,
@@ -1448,6 +1522,30 @@ function normalizedLines(s: Workspace, lines: LineInput[], key: 'price' | 'cost'
   });
 }
 function createInvoice(s: Workspace, data: InvoiceInput, id?: string) {
+  const deliveryDraft = id ? s.invoices.find((i) => i.id === id) : undefined;
+  if (deliveryDraft?.status === 'Draft' && deliveryDraft.deliveryIds.length) {
+    required(
+      data.lines.length === deliveryDraft.lines.length &&
+        data.lines.every((l, index) => {
+          const source = deliveryDraft.lines[index];
+          return (
+            l.productId === source.productId &&
+            (l.unit ?? source.unit) === source.unit &&
+            Number(l.qty) === source.qty &&
+            (l.price === undefined || Number(l.price) === source.price)
+          );
+        }) &&
+        data.customerId === deliveryDraft.customerId &&
+        (data.discount === undefined || Number(data.discount) === deliveryDraft.discount) &&
+        (data.taxRate === undefined || Number(data.taxRate) === deliveryDraft.taxRate),
+      "Lines come from delivery notes and can't be edited.",
+    );
+    return saveInvoiceHeader(s, deliveryDraft.id, {
+      date: data.date,
+      due: data.due ?? deliveryDraft.due,
+      notes: data.notes ?? deliveryDraft.notes,
+    });
+  }
   required(
     data.allowShortDated === undefined || typeof data.allowShortDated === 'boolean',
     'Allow short-dated stock must be a boolean.',
@@ -1513,8 +1611,8 @@ function createInvoice(s: Workspace, data: InvoiceInput, id?: string) {
     ...amounts,
     status: 'Draft',
     paid: 0,
-    payments: [],
-    allocations: [],
+    credited: 0,
+    deliveryIds: [],
     notes: String(data.notes || '').trim(),
   };
   if (id) s.invoices = s.invoices.map((i) => (i.id === id ? invoice : i));
@@ -1541,6 +1639,453 @@ function createInvoice(s: Workspace, data: InvoiceInput, id?: string) {
   }
   return invoice;
 }
+function invoiceDeliveryCheck(s: Workspace, ids: string[], exceptInvoiceId?: string): Delivery[] {
+  required(Array.isArray(ids) && ids.length > 0, 'Select at least one delivery.');
+  required(new Set(ids).size === ids.length, 'Select distinct deliveries.');
+  const deliveries = ids.map((id) => {
+    const d = deliveryById(s, id);
+    if (d.invoiceId) {
+      const invoice = s.invoices.find((i) => i.id === d.invoiceId)!;
+      throw new Error(`${d.number} is already invoiced (${invoice.number}).`);
+    }
+    const draft = s.invoices.find(
+      (i) => i.id !== exceptInvoiceId && i.status === 'Draft' && i.deliveryIds.includes(id),
+    );
+    required(!draft, `${d.number} is on draft ${draft?.number}.`);
+    required(
+      ['Dispatched', 'Delivered'].includes(d.status),
+      `${d.number} must be Dispatched or Delivered.`,
+    );
+    required(d.orderId, 'Select deliveries from sales orders.');
+    return d;
+  });
+  required(
+    deliveries.every((d) => d.customerId === deliveries[0].customerId),
+    'Select deliveries for the same customer.',
+  );
+  const taxRate = orderById(s, deliveries[0].orderId!).taxRate;
+  required(
+    deliveries.every((d) => orderById(s, d.orderId!).taxRate === taxRate),
+    'Invoice deliveries with different tax rates separately.',
+  );
+  return deliveries;
+}
+function invoiceHeader(
+  s: Workspace,
+  deliveries: Delivery[],
+  customerId: string,
+  input: { date?: string; due?: string; notes?: string },
+) {
+  const date = dateCheck(input.date ?? today());
+  required(date <= today(), 'Invoice date cannot be in the future.');
+  required(
+    deliveries.every((d) => date >= d.date!),
+    'Invoice date cannot be before the latest delivery date.',
+  );
+  const due = dateCheck(input.due ?? shift(contact(s, customerId)!.paymentTermsDays, date));
+  required(due >= date, 'Due date must be on or after the invoice date.');
+  return { date, due, notes: String(input.notes || '').trim() };
+}
+function createInvoiceFromDeliveries(
+  s: Workspace,
+  input: { deliveryIds: string[]; date?: string; due?: string; notes?: string },
+): Invoice {
+  const deliveries = invoiceDeliveryCheck(s, input.deliveryIds);
+  const customerId = deliveries[0].customerId;
+  const lines = deliveries.flatMap((d) =>
+    d.lines.map(({ productId, name, sku, unit, factor, qty, price }) => ({
+      productId,
+      name,
+      sku,
+      unit,
+      factor,
+      qty,
+      price,
+    })),
+  );
+  const orderIds = [...new Set(deliveries.map((d) => d.orderId!))];
+  const discount = sum(orderIds, (id) =>
+    round(
+      (deliveries
+        .filter((d) => d.orderId === id)
+        .reduce((n, d) => n + d.lines.reduce((v, l) => v + l.qty * l.price, 0), 0) *
+        orderById(s, id).discountPercent) /
+        100,
+    ),
+  );
+  const header = invoiceHeader(s, deliveries, customerId, input);
+  const invoice: Invoice = {
+    id: uid('invoice'),
+    number: `${s.settings.invoicePrefix}-${String(s.counters.invoice++).padStart(4, '0')}`,
+    customerId,
+    ...header,
+    lines,
+    ...totals(lines, discount, orderById(s, orderIds[0]).taxRate),
+    status: 'Draft',
+    paid: 0,
+    credited: 0,
+    allowShortDated: false,
+    deliveryIds: [...input.deliveryIds],
+    orderId: orderIds.length === 1 ? orderIds[0] : undefined,
+  };
+  required(invoice.total > 0, 'Invoice total must be greater than zero.');
+  s.invoices.unshift(invoice);
+  return invoice;
+}
+function saveInvoiceHeader(
+  s: Workspace,
+  id: string,
+  input: { date: string; due: string; notes: string },
+): Invoice {
+  const invoice = s.invoices.find((i) => i.id === id);
+  required(invoice?.status === 'Draft', 'Only draft invoices can be edited.');
+  Object.assign(invoice, invoiceHeader(s, deliveriesOf(s, invoice), invoice.customerId, input));
+  return invoice;
+}
+function uninvoicedDeliveries(s: Workspace, customerId?: string): Delivery[] {
+  return s.deliveries.filter(
+    (d) =>
+      ['Dispatched', 'Delivered'].includes(d.status) &&
+      !d.invoiceId &&
+      (!customerId || d.customerId === customerId),
+  );
+}
+function deliveryValue(s: Workspace, d: Delivery): number {
+  const order = d.orderId ? orderById(s, d.orderId) : undefined;
+  const subtotal = sum(d.lines, (l) => l.qty * l.price);
+  return totals(
+    d.lines,
+    round((subtotal * (order?.discountPercent ?? 0)) / 100),
+    order?.taxRate ?? 0,
+  ).total;
+}
+function deliveredNotInvoiced(
+  s: Workspace,
+  { customerId, asOf = today() }: { customerId?: string; asOf?: string } = {},
+) {
+  dateCheck(asOf);
+  return uninvoicedDeliveries(s, customerId)
+    .filter(
+      (d) =>
+        d.date! <= asOf &&
+        !s.invoices.some((i) => i.status === 'Draft' && i.deliveryIds.includes(d.id)),
+    )
+    .map((delivery) => {
+      const ageDays = daysLeft(asOf, delivery.date!);
+      return {
+        delivery,
+        customerId: delivery.customerId,
+        value: deliveryValue(s, delivery),
+        ageDays,
+        late:
+          contact(s, delivery.customerId)!.billing === 'monthly'
+            ? delivery.date!.slice(0, 7) < asOf.slice(0, 7)
+            : ageDays > 1,
+      };
+    });
+}
+function invoicedQty(s: Workspace, order: SalesOrder, lineId: string): number {
+  return s.deliveries
+    .filter((d) => d.orderId === order.id && d.invoiceId)
+    .reduce(
+      (n, d) => n + d.lines.filter((l) => l.orderLineId === lineId).reduce((v, l) => v + l.qty, 0),
+      0,
+    );
+}
+function deliveredQty(s: Workspace, order: SalesOrder, lineId: string): number {
+  return s.deliveries
+    .filter((d) => d.orderId === order.id && ['Dispatched', 'Delivered'].includes(d.status))
+    .flatMap((d) => d.lines)
+    .filter((l) => l.orderLineId === lineId)
+    .reduce((n, l) => n + l.qty, 0);
+}
+function openQty(s: Workspace, order: SalesOrder, lineId: string): number {
+  const line = order.lines.find((l) => l.id === lineId);
+  required(line, 'Order line not found.');
+  return line.qty - line.cancelledQty - deliveredQty(s, order, lineId);
+}
+function orderTotals(order: SalesOrder) {
+  const lines = order.lines.map((l) => ({ ...l, qty: l.qty - l.cancelledQty }));
+  return totals(
+    lines,
+    round((sum(lines, (l) => l.qty * l.price) * order.discountPercent) / 100),
+    order.taxRate,
+  );
+}
+function orderOpenValue(s: Workspace, order: SalesOrder): number {
+  const lines = order.lines.map((l) => ({ ...l, qty: openQty(s, order, l.id) }));
+  return totals(
+    lines,
+    round((sum(lines, (l) => l.qty * l.price) * order.discountPercent) / 100),
+    order.taxRate,
+  ).total;
+}
+function fulfilmentStatus(
+  s: Workspace,
+  order: SalesOrder,
+): 'Not delivered' | 'Partly delivered' | 'Delivered' {
+  const delivered = order.lines.reduce((n, l) => n + deliveredQty(s, order, l.id), 0);
+  return delivered === 0
+    ? 'Not delivered'
+    : order.lines.some((l) => openQty(s, order, l.id) > 0)
+      ? 'Partly delivered'
+      : 'Delivered';
+}
+function quoteStatus(order: SalesOrder): 'Quote' | 'Expired' {
+  return order.validUntil! < today() ? 'Expired' : 'Quote';
+}
+function orderById(s: Workspace, id: string): SalesOrder {
+  const order = s.orders.find((o) => o.id === id);
+  required(order, 'Order not found.');
+  return order;
+}
+function orderCreditOverride(
+  s: Workspace,
+  customerId: string,
+  amount: number,
+  override?: { reason: string },
+): CreditOverride | undefined {
+  const check = creditCheck(s, customerId, amount);
+  if (check.ok) return undefined;
+  required(override, check.reasons.join(' '));
+  const reason = String(override.reason || '').trim();
+  required(reason.length >= 5, 'Enter an override reason of at least 5 characters.');
+  // ponytail: anyone can override until roles exist; restrict to managers then
+  return { by: CURRENT_USER, at: new Date().toISOString(), reason, reasons: check.reasons };
+}
+function saveOrder(s: Workspace, input: OrderInput, id?: string): SalesOrder {
+  const previous = id ? orderById(s, id) : undefined;
+  required(!previous || !['Done', 'Cancelled'].includes(previous.status), 'This order is closed.');
+  const customer = contact(s, input.customerId);
+  required(customer?.type === 'Customer', 'Select a customer.');
+  required(
+    previous?.status !== 'Confirmed' || previous.customerId === input.customerId,
+    'The customer cannot change on a confirmed order.',
+  );
+  const date = dateCheck(input.date),
+    requestedDate = dateCheck(input.requestedDate);
+  required(date <= today(), 'Order date cannot be in the future.');
+  required(requestedDate >= date, 'Requested date must be on or after the order date.');
+  required(['delivery', 'pickup'].includes(input.fulfilment), 'Select delivery or pickup.');
+  required(
+    input.allowShortDated === undefined || typeof input.allowShortDated === 'boolean',
+    'Allow short-dated stock must be a boolean.',
+  );
+  required(Array.isArray(input.lines) && input.lines.length, 'Add at least one product.');
+  const normalized = normalizedLines(
+    s,
+    input.lines.map((l) => {
+      const p = product(s, l.productId);
+      return {
+        ...l,
+        price:
+          l.price ??
+          (p
+            ? priceFor(s, { productId: p.id, unit: l.unit ?? p.unit, customerId: customer.id })
+                .price
+            : undefined),
+      };
+    }),
+  );
+  const lineIds = new Set<string>();
+  const lines = normalized.map((line, index) => {
+    const lineId = input.lines[index].id;
+    const old = lineId ? previous?.lines.find((l) => l.id === lineId) : undefined;
+    required(!lineId || old, 'Order line not found.');
+    const delivered = old && previous ? deliveredQty(s, previous, old.id) : 0;
+    const cancelledQty = old?.cancelledQty ?? 0;
+    required(
+      line.qty >= delivered + cancelledQty,
+      `${line.name}: ${delivered + cancelledQty} already delivered or cancelled.`,
+    );
+    required(
+      !delivered || line.productId === old!.productId,
+      `${line.name}: delivered lines cannot be removed.`,
+    );
+    required(
+      !delivered ||
+        (line.price === old!.price && line.unit === old!.unit && line.factor === old!.factor),
+      `${line.name}: price and unit cannot change after delivery.`,
+    );
+    const result = { ...line, id: old?.id || uid('sol'), cancelledQty };
+    required(!lineIds.has(result.id), 'Order contains duplicate lines.');
+    lineIds.add(result.id);
+    return result;
+  });
+  previous?.lines.forEach((l) =>
+    required(
+      lineIds.has(l.id) || deliveredQty(s, previous, l.id) === 0,
+      `${l.name}: delivered lines cannot be removed.`,
+    ),
+  );
+  const discountPercent = moneyCheck(
+    input.discountPercent ?? previous?.discountPercent ?? 0,
+    'Discount percent',
+  );
+  const taxRate = moneyCheck(input.taxRate ?? previous?.taxRate ?? s.settings.taxRate, 'Tax rate');
+  required(discountPercent <= 100, 'Discount percent cannot exceed 100%.');
+  required(taxRate <= 100, 'Tax rate cannot exceed 100%.');
+  const validUntil =
+    previous?.status === 'Confirmed' ? undefined : dateCheck(input.validUntil ?? shift(14, date));
+  required(!validUntil || validUntil >= date, 'Valid until must be on or after the order date.');
+  const order: SalesOrder = {
+    ...previous,
+    id: previous?.id || uid('so'),
+    number: previous?.number || `SO-${String(s.counters.order).padStart(4, '0')}`,
+    status: previous?.status || 'Quote',
+    customerId: customer.id,
+    date,
+    validUntil,
+    requestedDate,
+    fulfilment: input.fulfilment,
+    deliveryAddress: String(input.deliveryAddress ?? customer.address).trim(),
+    lines,
+    discountPercent,
+    taxRate,
+    allowShortDated: input.allowShortDated ?? previous?.allowShortDated ?? false,
+    notes: String(input.notes || '').trim(),
+    createdAt: previous?.createdAt || new Date().toISOString(),
+    createdBy: previous?.createdBy || CURRENT_USER,
+  };
+  if (previous?.status === 'Confirmed') {
+    const increase = round(orderTotals(order).total - orderTotals(previous).total);
+    if (increase > 0)
+      order.creditOverride =
+        orderCreditOverride(s, customer.id, increase, input.override) ?? previous.creditOverride;
+  }
+  if (previous) s.orders = s.orders.map((o) => (o.id === id ? order : o));
+  else {
+    s.counters.order++;
+    s.orders.unshift(order);
+  }
+  if (order.status === 'Confirmed') {
+    reserveOrder(s, order.id);
+    closeIfDone(s, order.id);
+  } else if (!previous && input.asQuote === false)
+    confirmOrder(s, order.id, { override: input.override });
+  return order;
+}
+function confirmOrder(
+  s: Workspace,
+  id: string,
+  { override }: { override?: { reason: string } } = {},
+): SalesOrder {
+  const order = orderById(s, id);
+  required(order.status === 'Quote', 'Only quotations can be confirmed.');
+  required(
+    quoteStatus(order) !== 'Expired',
+    `Quote expired on ${order.validUntil}. Update and save it first.`,
+  );
+  order.lines.forEach((l) => activeProduct(s, l.productId));
+  const creditOverride = orderCreditOverride(
+    s,
+    order.customerId,
+    orderOpenValue(s, order),
+    override,
+  );
+  if (creditOverride) order.creditOverride = creditOverride;
+  order.status = 'Confirmed';
+  order.confirmedAt = new Date().toISOString();
+  order.confirmedBy = CURRENT_USER;
+  delete order.validUntil;
+  reserveOrder(s, id);
+  return order;
+}
+function reserveOrder(s: Workspace, id: string): void {
+  // ponytail: backorders aren't auto-reserved when stock arrives; staff use "Reserve available stock". Hook into receipts if this gets missed.
+  const order = orderById(s, id),
+    demand = new Map<string, number>();
+  if (order.status === 'Confirmed')
+    order.lines.forEach((l) =>
+      demand.set(l.productId, (demand.get(l.productId) || 0) + openQty(s, order, l.id) * l.factor),
+    );
+  const existing = s.reservations.filter(
+    (r) => r.source === 'sales_order' && r.sourceId === id && r.status === 'Active',
+  );
+  const productIds = new Set([...demand.keys(), ...existing.map((r) => r.productId)]);
+  productIds.forEach((productId) => {
+    const target = Math.max(
+      0,
+      Math.min(
+        demand.get(productId) || 0,
+        free(s, productId, {
+          customerId: order.customerId,
+          allowShortDated: order.allowShortDated,
+          exceptSourceId: id,
+        }),
+      ),
+    );
+    const reservation = existing.find((r) => r.productId === productId);
+    if (reservation) {
+      if (target > 0) Object.assign(reservation, { qty: target });
+      else releaseReservation(s, reservation.id);
+    } else if (target > 0)
+      addReservation(s, {
+        productId,
+        customerId: order.customerId,
+        qty: target,
+        source: 'sales_order',
+        sourceId: id,
+        note: '',
+      });
+  });
+}
+function closeIfDone(s: Workspace, id: string): void {
+  const order = orderById(s, id);
+  if (order.status === 'Confirmed' && order.lines.every((l) => openQty(s, order, l.id) === 0)) {
+    order.status = 'Done';
+    order.closedAt = new Date().toISOString();
+  }
+}
+function cancelRemaining(
+  s: Workspace,
+  id: string,
+  { lineId, reason }: { lineId?: string; reason: string },
+): void {
+  const order = orderById(s, id);
+  required(order.status === 'Confirmed', 'Only confirmed orders can cancel remaining quantities.');
+  required(String(reason || '').trim(), 'Enter a cancellation reason.');
+  required(!lineId || order.lines.some((l) => l.id === lineId), 'Order line not found.');
+  order.lines
+    .filter((l) => !lineId || l.id === lineId)
+    .forEach((l) => (l.cancelledQty += pendingDeliveryQty(s, order, l.id)));
+  order.cancelReason = String(reason).trim();
+  reserveOrder(s, id);
+  closeIfDone(s, id);
+}
+function cancelOrder(s: Workspace, id: string, reason: string): void {
+  const order = orderById(s, id);
+  required(['Quote', 'Confirmed'].includes(order.status), 'This order is closed.');
+  required(
+    !order.lines.some((l) => deliveredQty(s, order, l.id) > 0),
+    'Part of this order was delivered. Cancel the remaining quantities instead.',
+  );
+  required(String(reason || '').trim(), 'Enter a cancellation reason.');
+  order.status = 'Cancelled';
+  order.cancelReason = String(reason).trim();
+  order.closedAt = new Date().toISOString();
+  reserveOrder(s, id);
+}
+// Product reservations are shared by lines; allocate in document order for display.
+function orderLineReserved(s: Workspace, order: SalesOrder, lineId: string): number {
+  const line = order.lines.find((l) => l.id === lineId);
+  required(line, 'Order line not found.');
+  let remaining = s.reservations
+    .filter(
+      (r) =>
+        r.source === 'sales_order' &&
+        r.sourceId === order.id &&
+        r.productId === line.productId &&
+        r.status === 'Active',
+    )
+    .reduce((n, r) => n + r.qty, 0);
+  for (const l of order.lines.filter((l) => l.productId === line.productId)) {
+    const allocated = Math.min(openQty(s, order, l.id) * l.factor, remaining);
+    if (l.id === lineId) return allocated / l.factor;
+    remaining -= allocated;
+  }
+  return 0;
+}
 function creditCheck(
   s: Workspace,
   customerId: string,
@@ -1556,14 +2101,17 @@ function creditCheck(
   required(c?.type === 'Customer', 'Select a customer.');
   const invoices = s.invoices.filter((i) => i.customerId === customerId);
   let exposure = sum(invoices, invoiceBalance);
-  // 003: add confirmed but undelivered order lines.
-  // 005: add deliveries not yet invoiced.
-  // 007: subtract available customer credit.
-  exposure = round(exposure + moneyCheck(addAmount));
-  const overdue = sum(
-    invoices.filter((i) => i.status === 'Issued' && daysLeft(i.due) < -s.settings.overdueGraceDays),
-    invoiceBalance,
+  exposure = round(
+    exposure +
+      sum(
+        s.orders.filter((o) => o.customerId === customerId && o.status === 'Confirmed'),
+        (o) => orderOpenValue(s, o),
+      ),
   );
+  exposure = round(exposure + sum(uninvoicedDeliveries(s, customerId), (d) => deliveryValue(s, d)));
+  exposure = round(exposure - customerCredit(s, customerId));
+  exposure = round(exposure + moneyCheck(addAmount));
+  const overdue = overdueAmount(s, customerId, s.settings.overdueGraceDays);
   const reasons: string[] = [];
   if (c.onHold) reasons.push(`Account on hold: ${c.holdReason}.`);
   if (c.creditLimit !== null && exposure > c.creditLimit)
@@ -1576,9 +2124,469 @@ function creditCheck(
     );
   return { ok: reasons.length === 0, reasons, exposure, limit: c.creditLimit, overdue };
 }
-function issueInvoice(s: Workspace, id: string, override?: { reason: string }) {
+const deliveriesOf = (s: Workspace, invoice: Invoice): Delivery[] =>
+  invoice.deliveryIds.map((id) => s.deliveries.find((d) => d.id === id)!).filter(Boolean);
+const invoiceCost = (s: Workspace, invoice: Invoice): number =>
+  sum(deliveriesOf(s, invoice), (d) => d.cost);
+const invoicePicks = (s: Workspace, invoice: Invoice): DeliveryPick[] =>
+  deliveriesOf(s, invoice).flatMap((d) => d.lines.flatMap((l) => l.picks));
+function deliveryById(s: Workspace, id: string, status?: Delivery['status']): Delivery {
+  const delivery = s.deliveries.find((d) => d.id === id);
+  required(delivery, 'Delivery not found.');
+  required(!status || delivery.status === status, `Delivery must be ${status}.`);
+  return delivery;
+}
+function deliveryOptions(s: Workspace, d: Delivery): SaleOptions {
+  return {
+    customerId: d.customerId,
+    allowShortDated: d.orderId
+      ? orderById(s, d.orderId).allowShortDated
+      : (s.invoices.find((i) => i.deliveryIds.includes(d.id))?.allowShortDated ?? false),
+  };
+}
+function pickOf(batch: Batch, qty: number): DeliveryPick {
+  return {
+    batchId: batch.id,
+    warehouseId: batch.warehouseId,
+    lotCode: batch.code,
+    expiry: batch.expiry,
+    qty,
+    cost: 0,
+  };
+}
+function proposePicks(
+  s: Workspace,
+  lines: Array<DeliveryLine | Invoice['lines'][number]>,
+  opts: SaleOptions,
+  warehouseId?: string,
+): DeliveryLine[] {
+  const used = new Map<string, number>();
+  return lines.map((line) => {
+    let remaining = line.qty * line.factor;
+    const picks: DeliveryPick[] = [];
+    for (const batch of eligibleBatches(s, line.productId, opts).filter(
+      (b) => !warehouseId || b.warehouseId === warehouseId,
+    )) {
+      const take = Math.min(remaining, batch.qty - (used.get(batch.id) || 0));
+      if (take > 0) {
+        picks.push(pickOf(batch, take));
+        used.set(batch.id, (used.get(batch.id) || 0) + take);
+        remaining -= take;
+      }
+      if (!remaining) break;
+    }
+    required(!remaining, `Not enough pickable stock: ${line.name}.`);
+    return {
+      id: uid('dl'),
+      ...('orderLineId' in line ? { orderLineId: line.orderLineId } : {}),
+      productId: line.productId,
+      name: line.name,
+      sku: line.sku,
+      unit: line.unit,
+      factor: line.factor,
+      qty: line.qty,
+      price: line.price,
+      picks,
+    };
+  });
+}
+function newDelivery(
+  s: Workspace,
+  input: Pick<Delivery, 'customerId' | 'method' | 'address' | 'lines'> & {
+    orderId?: string;
+    warehouseId?: string;
+  },
+): Delivery {
+  const delivery: Delivery = {
+    ...input,
+    id: uid('dn'),
+    number: `DN-${String(s.counters.delivery++).padStart(4, '0')}`,
+    status: 'Picking',
+    cost: 0,
+    driver: '',
+    receivedBy: '',
+    returnReason: '',
+    createdAt: new Date().toISOString(),
+    createdBy: CURRENT_USER,
+  };
+  s.deliveries.unshift(delivery);
+  return delivery;
+}
+function pendingDeliveryQty(
+  s: Workspace,
+  order: SalesOrder,
+  lineId: string,
+  exceptId?: string,
+): number {
+  return (
+    openQty(s, order, lineId) -
+    s.deliveries
+      .filter((d) => d.orderId === order.id && d.status === 'Picking' && d.id !== exceptId)
+      .flatMap((d) => d.lines)
+      .filter((l) => l.orderLineId === lineId)
+      .reduce((n, l) => n + l.qty, 0)
+  );
+}
+function deliveryPickable(
+  s: Workspace,
+  order: SalesOrder,
+  productId: string,
+  warehouseId: string,
+): number {
+  const opts = {
+    customerId: order.customerId,
+    allowShortDated: order.allowShortDated,
+    exceptSourceId: order.id,
+  };
+  return Math.max(
+    0,
+    Math.min(
+      sum(
+        eligibleBatches(s, productId, opts).filter((b) => b.warehouseId === warehouseId),
+        (b) => b.qty,
+      ),
+      free(s, productId, opts),
+    ),
+  );
+}
+function deliveryQuantities(
+  s: Workspace,
+  order: SalesOrder,
+  warehouseId: string,
+): { orderLineId: string; qty: number }[] {
+  const used = new Map<string, number>();
+  return order.lines.map((l) => {
+    const pickable = Math.max(
+      0,
+      deliveryPickable(s, order, l.productId, warehouseId) - (used.get(l.productId) || 0),
+    );
+    const qty = Math.max(
+      0,
+      Math.min(pendingDeliveryQty(s, order, l.id), Math.floor(pickable / l.factor)),
+    );
+    used.set(l.productId, (used.get(l.productId) || 0) + qty * l.factor);
+    return { orderLineId: l.id, qty };
+  });
+}
+function createDelivery(
+  s: Workspace,
+  input: {
+    orderId: string;
+    warehouseId: string;
+    method?: Delivery['method'];
+    lines?: { orderLineId: string; qty: number }[];
+  },
+): Delivery {
+  const order = orderById(s, input.orderId),
+    wh = warehouse(s, input.warehouseId);
+  required(order.status === 'Confirmed', 'Only confirmed orders can create deliveries.');
+  required(wh, 'Select a warehouse.');
+  const method = input.method ?? order.fulfilment;
+  required(['delivery', 'pickup'].includes(method), 'Select Delivery or Pickup.');
+  if (input.lines)
+    required(
+      new Set(input.lines.map((l) => l.orderLineId)).size === input.lines.length,
+      'Select distinct order lines.',
+    );
+  const used = new Map<string, number>();
+  const lines = (
+    input.lines ?? deliveryQuantities(s, order, wh.id).filter((l) => l.qty > 0)
+  ).flatMap((inputLine) => {
+    const line = order.lines.find((l) => l.id === inputLine.orderLineId);
+    required(line, 'Order line not found.');
+    const pending = pendingDeliveryQty(s, order, line.id);
+    const pickable = Math.max(
+      0,
+      deliveryPickable(s, order, line.productId, wh.id) - (used.get(line.productId) || 0),
+    );
+    const qty = qtyCheck(inputLine.qty);
+    required(qty <= pending, `${line.name}: only ${pending} remain to pick.`);
+    required(
+      qty * line.factor <= pickable,
+      `${line.name}: only ${Math.floor(pickable / line.factor)} can be picked here.`,
+    );
+    used.set(line.productId, (used.get(line.productId) || 0) + qty * line.factor);
+    return [{ ...line, orderLineId: line.id, qty, picks: [] }];
+  });
+  required(lines.length, `Nothing can be picked from ${wh.name} for this order.`);
+  return newDelivery(s, {
+    orderId: order.id,
+    warehouseId: wh.id,
+    customerId: order.customerId,
+    method,
+    address: order.deliveryAddress,
+    lines: proposePicks(
+      s,
+      lines,
+      { customerId: order.customerId, allowShortDated: order.allowShortDated },
+      wh.id,
+    ),
+  });
+}
+function setPicks(
+  s: Workspace,
+  deliveryId: string,
+  lineId: string,
+  picks: { batchId: string; qty: number }[],
+): void {
+  const d = deliveryById(s, deliveryId, 'Picking'),
+    line = d.lines.find((l) => l.id === lineId);
+  required(line, 'Delivery line not found.');
+  required(
+    new Set(picks.map((p) => p.batchId)).size === picks.length,
+    'Select each lot only once.',
+  );
+  const eligible = eligibleBatches(s, line.productId, deliveryOptions(s, d));
+  const next = picks.map((p) => {
+    const batch = eligible.find((b) => b.id === p.batchId);
+    required(
+      batch && (!d.warehouseId || batch.warehouseId === d.warehouseId),
+      'Select an eligible lot in the delivery warehouse.',
+    );
+    const qty = qtyCheck(p.qty),
+      other = d.lines
+        .filter((l) => l.id !== lineId)
+        .flatMap((l) => l.picks)
+        .filter((p) => p.batchId === batch.id)
+        .reduce((n, p) => n + p.qty, 0);
+    required(
+      qty + other <= batch.qty,
+      `Not enough stock in lot ${batch.code} (${batch.qty} available).`,
+    );
+    return pickOf(batch, qty);
+  });
+  required(
+    next.reduce((n, p) => n + p.qty, 0) === line.qty * line.factor,
+    'Pick quantities must equal the delivery line base quantity.',
+  );
+  line.picks = next;
+}
+function cancelDelivery(s: Workspace, id: string): void {
+  deliveryById(s, id, 'Picking').status = 'Cancelled';
+}
+function dispatchDelivery(
+  s: Workspace,
+  id: string,
+  input: { date?: string; driver?: string; receivedBy?: string } = {},
+): Delivery {
+  const d = deliveryById(s, id, 'Picking'),
+    date = dateCheck(input.date ?? today());
+  required(date <= today(), 'Dispatch date cannot be in the future.');
+  const receivedBy = String(input.receivedBy || '').trim();
+  required(d.method !== 'pickup' || receivedBy, 'Enter who received the goods.');
+  const opts = deliveryOptions(s, d),
+    used = new Map<string, number>();
+  if (d.orderId) {
+    const order = orderById(s, d.orderId);
+    required(order.status === 'Confirmed', 'Only confirmed orders can dispatch deliveries.');
+    d.lines.forEach((l) => {
+      const current = order.lines.find((line) => line.id === l.orderLineId);
+      required(
+        current &&
+          current.productId === l.productId &&
+          current.unit === l.unit &&
+          current.factor === l.factor &&
+          current.price === l.price,
+        'Order changed since picking. Cancel this delivery and create it again.',
+      );
+      required(
+        l.qty <= openQty(s, order, l.orderLineId!),
+        `${l.name}: delivery exceeds the open quantity.`,
+      );
+    });
+  }
+  d.lines.forEach((l) => {
+    activeProduct(s, l.productId);
+    required(
+      l.picks.reduce((n, p) => n + p.qty, 0) === l.qty * l.factor,
+      'Pick quantities must equal the delivery line base quantity.',
+    );
+    l.picks.forEach((p) => {
+      const b = eligibleBatches(s, l.productId, opts).find((b) => b.id === p.batchId);
+      const need = (used.get(p.batchId) || 0) + p.qty;
+      required(
+        b &&
+          (!d.warehouseId || b.warehouseId === d.warehouseId) &&
+          b.warehouseId === p.warehouseId &&
+          b.code === p.lotCode &&
+          b.expiry === p.expiry &&
+          b.qty >= need,
+        `Lot ${p.lotCode} changed since picking. Update the picks.`,
+      );
+      used.set(p.batchId, need);
+    });
+  });
+  if (d.orderId) {
+    const order = orderById(s, d.orderId);
+    for (const productId of new Set(d.lines.map((l) => l.productId))) {
+      const need = d.lines
+        .filter((l) => l.productId === productId)
+        .reduce((n, l) => n + l.qty * l.factor, 0);
+      required(
+        need <= free(s, productId, { ...opts, exceptSourceId: order.id }),
+        `Not enough free stock: ${product(s, productId)!.name}.`,
+      );
+    }
+  }
+  d.lines.forEach((l) =>
+    l.picks.forEach((p) => {
+      const batch = s.batches.find((b) => b.id === p.batchId)!;
+      p.cost = batch.cost;
+      moveStock(s, batch, -p.qty, {
+        type: 'sale',
+        date,
+        reference: d.number,
+        sourceId: d.id,
+        counterpartyId: d.customerId,
+      });
+    }),
+  );
+  d.cost = sum(
+    d.lines.flatMap((l) => l.picks),
+    (p) => p.qty * p.cost,
+  );
+  ledger(s, date, d.number, `Delivery — ${contact(s, d.customerId)!.name}`, [
+    { account: 'cogs', debit: d.cost },
+    { account: 'inventory', credit: d.cost },
+  ]);
+  d.date = date;
+  d.dispatchedAt = new Date().toISOString();
+  d.dispatchedBy = CURRENT_USER;
+  d.driver = d.method === 'pickup' ? '' : String(input.driver || '').trim();
+  d.status = d.method === 'pickup' ? 'Delivered' : 'Dispatched';
+  if (d.method === 'pickup') {
+    d.receivedBy = receivedBy;
+    d.deliveredAt = new Date(date + 'T12:00:00').toISOString();
+  }
+  if (d.orderId) {
+    reserveOrder(s, d.orderId);
+    closeIfDone(s, d.orderId);
+  }
+  activity(
+    s,
+    'sale',
+    'Delivery dispatched',
+    `${d.number} · ${contact(s, d.customerId)!.name}`,
+    date,
+  );
+  return d;
+}
+function confirmDelivered(
+  s: Workspace,
+  id: string,
+  input: { receivedBy: string; date?: string },
+): void {
+  const d = deliveryById(s, id, 'Dispatched'),
+    receivedBy = String(input.receivedBy || '').trim(),
+    date = dateCheck(input.date ?? today());
+  required(receivedBy, 'Enter who received the goods.');
+  required(date >= d.date! && date <= today(), 'Delivery date must be between dispatch and today.');
+  d.status = 'Delivered';
+  d.receivedBy = receivedBy;
+  d.deliveredAt = new Date(date + 'T12:00:00').toISOString();
+}
+function returnToStock(
+  s: Workspace,
+  input: {
+    batchId: string;
+    qty: number;
+    quarantine: boolean;
+    reference: string;
+    sourceId: string;
+    counterpartyId: string;
+    date: string;
+  },
+): Batch {
+  const original = s.batches.find((b) => b.id === input.batchId);
+  required(original, 'Batch not found.');
+  const qty = qtyCheck(input.qty);
+  let target = original;
+  if (input.quarantine) {
+    target = s.batches.find(
+      (b) =>
+        b.productId === original.productId &&
+        b.code === original.code &&
+        b.expiry === original.expiry &&
+        b.cost === original.cost &&
+        b.warehouseId === original.warehouseId &&
+        b.quarantined,
+    )! || { ...original, id: uid('batch'), qty: 0, quarantined: true };
+    if (!s.batches.includes(target)) s.batches.push(target);
+  }
+  moveStock(s, target, qty, {
+    type: 'return',
+    date: input.date,
+    reference: input.reference,
+    sourceId: input.sourceId,
+    counterpartyId: input.counterpartyId,
+  });
+  return target;
+}
+function markNotDelivered(s: Workspace, id: string, reason: string): void {
+  const d = deliveryById(s, id);
+  required(!d.invoiceId, 'This delivery is invoiced. Issue a credit note instead.');
+  const draft = s.invoices.find((i) => i.status === 'Draft' && i.deliveryIds.includes(id));
+  required(!draft, `${d.number} is on draft ${draft?.number}. Delete the draft first.`);
+  required(d.status === 'Dispatched', 'Delivery must be Dispatched.');
+  required(String(reason || '').trim(), 'Enter a return reason.');
+  d.lines.forEach((l) =>
+    l.picks.forEach((p) =>
+      returnToStock(s, {
+        batchId: p.batchId,
+        qty: p.qty,
+        quarantine: true,
+        reference: d.number,
+        sourceId: d.id,
+        counterpartyId: d.customerId,
+        date: today(),
+      }),
+    ),
+  );
+  ledger(s, today(), d.number, `Delivery returned — ${contact(s, d.customerId)!.name}`, [
+    { account: 'inventory', debit: d.cost },
+    { account: 'cogs', credit: d.cost },
+  ]);
+  d.status = 'Returned';
+  d.returnReason = String(reason).trim();
+  if (d.orderId) {
+    const order = orderById(s, d.orderId);
+    if (order.status === 'Done') {
+      order.status = 'Confirmed';
+      delete order.closedAt;
+    }
+    reserveOrder(s, order.id);
+  }
+}
+function issueInvoice(
+  s: Workspace,
+  id: string,
+  options?: { reason: string } | { override?: { reason: string } },
+) {
   const inv = s.invoices.find((i) => i.id === id);
   required(inv && inv.status === 'Draft', 'Only draft invoices can be issued.');
+  if (inv.deliveryIds.length) {
+    const deliveries = invoiceDeliveryCheck(s, inv.deliveryIds, inv.id);
+    invoiceHeader(s, deliveries, inv.customerId, inv);
+    const entries: { account: AccountId; debit?: number; credit?: number }[] = [
+      { account: 'receivable', debit: inv.total },
+      { account: 'revenue', credit: round(inv.subtotal - inv.discount) },
+    ];
+    if (inv.taxAmount) entries.push({ account: 'tax', credit: inv.taxAmount });
+    ledger(s, inv.date, inv.number, 'Sale — ' + contact(s, inv.customerId)!.name, entries);
+    inv.status = 'Issued';
+    deliveries.forEach((d) => (d.invoiceId = inv.id));
+    if (customerCredit(s, inv.customerId) > 0 && invoiceBalance(inv) > 0)
+      applyCredit(s, { customerId: inv.customerId, invoiceId: inv.id });
+    activity(
+      s,
+      'sale',
+      'Invoice issued',
+      `${inv.number} · ${contact(s, inv.customerId)!.name}`,
+      inv.date,
+    );
+    return inv;
+  }
+  const override = options && 'reason' in options ? options : options?.override;
   const check = creditCheck(s, inv.customerId, inv.total);
   let creditOverride: Invoice['creditOverride'];
   if (!check.ok) {
@@ -1622,38 +2630,22 @@ function issueInvoice(s: Workspace, id: string, override?: { reason: string }) {
           : `Only ${long} ${unitLabel(p.unit, long)} of ${p.name} have at least ${shelfLifeFor(s, inv.customerId)} days of shelf life (${short} more are short-dated). Tick "Allow short-dated stock" if the customer accepts them.`,
     );
   });
-  const allocations: Allocation[] = [];
-  inv.lines.forEach((l) => {
-    let remaining = l.qty * l.factor;
-    const batches = eligibleBatches(s, l.productId, opts);
-    for (const b of batches) {
-      if (!remaining) break;
-      const take = Math.min(remaining, b.qty);
-      moveStock(s, b, -take, {
-        type: 'sale',
-        date: inv.date,
-        reference: inv.number,
-        sourceId: inv.id,
-        counterpartyId: inv.customerId,
-      });
-      remaining -= take;
-      allocations.push({
-        batchId: b.id,
-        code: b.code,
-        warehouseId: b.warehouseId,
-        productId: l.productId,
-        qty: take,
-        cost: b.cost,
-      });
-    }
+  const delivery = newDelivery(s, {
+    customerId: inv.customerId,
+    method: 'pickup',
+    address: contact(s, inv.customerId)!.address,
+    lines: proposePicks(s, inv.lines, opts),
   });
-  const cost = sum(allocations, (a) => a.qty * a.cost);
+  inv.deliveryIds = [delivery.id];
+  dispatchDelivery(s, delivery.id, {
+    date: inv.date,
+    receivedBy: contact(s, inv.customerId)!.name,
+  });
   const entries: { account: AccountId; debit?: number; credit?: number }[] = [
     { account: 'receivable', debit: inv.total },
     { account: 'revenue', credit: round(inv.subtotal - inv.discount) },
   ];
   if (inv.taxAmount) entries.push({ account: 'tax', credit: inv.taxAmount });
-  entries.push({ account: 'cogs', debit: cost }, { account: 'inventory', credit: cost });
   ledger(s, inv.date, inv.number, 'Sale — ' + contact(s, inv.customerId)!.name, entries);
   inv.status = 'Issued';
   if (creditOverride) inv.creditOverride = creditOverride;
@@ -1663,8 +2655,10 @@ function issueInvoice(s: Workspace, id: string, override?: { reason: string }) {
       r.status = 'Fulfilled';
       r.closedAt = new Date().toISOString();
     });
-  inv.allocations = allocations;
-  inv.cogs = cost;
+  inv.deliveryIds = [delivery.id];
+  delivery.invoiceId = inv.id;
+  if (customerCredit(s, inv.customerId) > 0 && invoiceBalance(inv) > 0)
+    applyCredit(s, { customerId: inv.customerId, invoiceId: inv.id });
   activity(
     s,
     'sale',
@@ -1685,6 +2679,506 @@ function customerAccountStatus(s: Workspace, customerId: string) {
         ? 'Overdue'
         : 'OK';
 }
+const creditReasons: CreditReason[] = [
+  'wrong_prescription',
+  'wrong_item',
+  'damaged',
+  'expired',
+  'not_ordered',
+  'price_error',
+  'other',
+];
+function netSales(s: Workspace, from: string, to = today()) {
+  return round(
+    sum(
+      s.invoices.filter((i) => i.status === 'Issued' && i.date >= from && i.date <= to),
+      (i) => i.subtotal - i.discount,
+    ) -
+      sum(
+        s.creditNotes.filter((cn) => cn.status === 'Issued' && cn.date >= from && cn.date <= to),
+        (cn) => cn.subtotal - cn.discount,
+      ),
+  );
+}
+const creditAvailable = (cn: CreditNote) =>
+  round(cn.total - sum(cn.allocations, (a) => a.amount) - cn.refunded);
+function creditNoteAmounts(invoice: Invoice, lines: { qty: number; price: number }[]) {
+  const subtotal = sum(lines, (l) => l.qty * l.price);
+  return totals(
+    lines,
+    invoice.subtotal ? round((subtotal * invoice.discount) / invoice.subtotal) : 0,
+    invoice.taxRate,
+  );
+}
+function creditNotePicks(s: Workspace, invoice: Invoice, productId: string): DeliveryPick[] {
+  const picks: DeliveryPick[] = [];
+  deliveriesOf(s, invoice)
+    .flatMap((d) => d.lines)
+    .filter((l) => l.productId === productId)
+    .flatMap((l) => l.picks)
+    .forEach((pick) => {
+      const existing = picks.find((p) => p.batchId === pick.batchId);
+      if (existing) picks[picks.indexOf(existing)] = { ...existing, qty: existing.qty + pick.qty };
+      else picks.push({ ...pick });
+    });
+  return picks.sort((a, b) => b.expiry.localeCompare(a.expiry));
+}
+function creditReturnOptions(
+  s: Workspace,
+  invoice: Invoice,
+  productId: string,
+  pending: CreditNoteLine[] = [],
+) {
+  const returned = [
+    ...s.creditNotes
+      .filter((cn) => cn.status === 'Issued' && cn.invoiceId === invoice.id)
+      .flatMap((cn) => cn.lines),
+    ...pending,
+  ]
+    .filter((l) => l.productId === productId)
+    .flatMap((l) => l.returns);
+  return creditNotePicks(s, invoice, productId).map((pick) => ({
+    ...pick,
+    remaining:
+      pick.qty -
+      sum(
+        returned.filter((p) => p.batchId === pick.batchId),
+        (p) => p.qty,
+      ),
+  }));
+}
+function proposeCreditReturns(options: ReturnType<typeof creditReturnOptions>, baseQty: number) {
+  let need = baseQty;
+  return options.flatMap((pick) => {
+    const qty = Math.max(0, Math.min(need, pick.remaining));
+    need -= qty;
+    return qty > 0 ? [{ batchId: pick.batchId, qty }] : [];
+  });
+}
+function prepareCreditNote(s: Workspace, input: CreditNoteInput, id?: string, checkCaps = true) {
+  const invoice = s.invoices.find((i) => i.id === input.invoiceId);
+  required(invoice?.status === 'Issued', 'Select an issued invoice.');
+  required(['return', 'correction'].includes(input.kind), 'Select return or correction.');
+  required(creditReasons.includes(input.reason), 'Select a credit reason.');
+  required(['refund', 'credit'].includes(input.settlement), 'Select refund or customer credit.');
+  const date = dateCheck(input.date || today());
+  required(
+    date >= invoice.date && date <= today(),
+    'Credit note date must be between the invoice date and today.',
+  );
+  const note = String(input.note || '').trim();
+  required(input.reason !== 'other' || note, 'Enter a note for other.');
+  const refundMethod = String(input.refundMethod || '').trim();
+  required(input.settlement !== 'refund' || refundMethod, 'Select a refund method.');
+  required(Array.isArray(input.lines) && input.lines.length, 'Add at least one credit note line.');
+  const issued = checkCaps
+    ? s.creditNotes.filter(
+        (cn) => cn.id !== id && cn.invoiceId === invoice.id && cn.status === 'Issued',
+      )
+    : [];
+  const priorLines = issued.flatMap((cn) => cn.lines);
+  const lines: CreditNoteLine[] = [];
+  const capMessage = 'This would credit more than was invoiced.';
+  for (const inputLine of input.lines) {
+    const index = inputLine.invoiceLineIndex;
+    const original = invoice.lines[index];
+    required(
+      Number.isInteger(index) && original && !lines.some((l) => l.invoiceLineIndex === index),
+      'Select a distinct invoice line.',
+    );
+    const qty = qtyCheck(inputLine.qty);
+    required(qty <= original.qty, capMessage);
+    const price =
+      input.kind === 'return' ? original.price : moneyCheck(inputLine.price, 'Credit price');
+    required((input.kind === 'return' || price > 0) && price <= original.price, capMessage);
+    required(
+      input.kind !== 'return' || inputLine.price === undefined || Number(inputLine.price) === price,
+      'Return price must match the invoice price.',
+    );
+    const line: CreditNoteLine = { ...original, invoiceLineIndex: index, qty, price, returns: [] };
+    if (input.kind === 'return') {
+      const already = issued.filter((cn) => cn.kind === 'return').flatMap((cn) => cn.lines);
+      required(
+        qty +
+          sum(
+            already.filter((l) => l.invoiceLineIndex === index),
+            (l) => l.qty,
+          ) <=
+          original.qty,
+        capMessage,
+      );
+      const picks = creditNotePicks(s, invoice, original.productId);
+      const used = [...already, ...lines]
+        .filter((l) => l.productId === original.productId)
+        .flatMap((l) => l.returns);
+      const remaining = (batchId: string) =>
+        (picks.find((p) => p.batchId === batchId)?.qty || 0) -
+        sum(
+          used.filter((p) => p.batchId === batchId),
+          (p) => p.qty,
+        );
+      let returns = inputLine.returns;
+      if (returns === undefined) {
+        returns = proposeCreditReturns(
+          picks.map((p) => ({ ...p, remaining: remaining(p.batchId) })),
+          qty * original.factor,
+        );
+        required(sum(returns, (p) => Number(p.qty)) === qty * original.factor, capMessage);
+      }
+      required(Array.isArray(returns), 'Select return lots.');
+      for (const returned of returns) {
+        const pick = picks.find((p) => p.batchId === returned.batchId);
+        required(
+          pick && !line.returns.some((p) => p.batchId === returned.batchId),
+          'Return lot must be one of the invoice picks.',
+        );
+        const returnQty = qtyCheck(returned.qty);
+        required(returnQty <= remaining(pick.batchId), capMessage);
+        line.returns.push({
+          batchId: pick.batchId,
+          warehouseId: pick.warehouseId,
+          lotCode: pick.lotCode,
+          qty: returnQty,
+          cost: pick.cost,
+        });
+      }
+      required(
+        sum(line.returns, (p) => p.qty) === qty * original.factor,
+        'Return quantities must match the credited base quantity.',
+      );
+    } else required(!inputLine.returns?.length, 'Price corrections cannot return stock.');
+    required(
+      round(
+        sum(
+          priorLines.filter((l) => l.invoiceLineIndex === index),
+          (l) => l.qty * l.price,
+        ) +
+          qty * price,
+      ) <= round(original.qty * original.price),
+      capMessage,
+    );
+    lines.push(line);
+  }
+  const amounts = creditNoteAmounts(invoice, lines);
+  required(round(sum(issued, (cn) => cn.total) + amounts.total) <= invoice.total, capMessage);
+  return {
+    invoiceId: invoice.id,
+    customerId: invoice.customerId,
+    date,
+    kind: input.kind,
+    reason: input.reason,
+    note,
+    lines,
+    ...amounts,
+    returnCost: sum(lines, (l) => sum(l.returns, (p) => p.qty * p.cost)),
+    settlement: input.settlement,
+    refundMethod,
+  };
+}
+function saveCreditNote(s: Workspace, input: CreditNoteInput, id?: string): CreditNote {
+  const previous = s.creditNotes.find((cn) => cn.id === id);
+  required(!id || previous?.status === 'Draft', 'Only draft credit notes can be edited.');
+  const prepared = prepareCreditNote(s, input, id);
+  const cn: CreditNote = {
+    ...prepared,
+    id: id || uid('cn'),
+    number: previous?.number || `CN-${String(s.counters.creditNote++).padStart(4, '0')}`,
+    allocations: [],
+    refunded: 0,
+    status: 'Draft',
+    createdAt: previous?.createdAt || new Date().toISOString(),
+    createdBy: previous?.createdBy || CURRENT_USER,
+  };
+  if (id) s.creditNotes = s.creditNotes.map((c) => (c.id === id ? cn : c));
+  else s.creditNotes.unshift(cn);
+  return cn;
+}
+function deleteCreditNote(s: Workspace, id: string): void {
+  required(
+    s.creditNotes.find((cn) => cn.id === id)?.status === 'Draft',
+    'Only draft credit notes can be deleted.',
+  );
+  s.creditNotes = s.creditNotes.filter((cn) => cn.id !== id);
+}
+function issueCreditNote(s: Workspace, id: string): CreditNote {
+  const cn = s.creditNotes.find((cn) => cn.id === id);
+  required(cn?.status === 'Draft', 'Only draft credit notes can be issued.');
+  Object.assign(cn, prepareCreditNote(s, cn, id));
+  const invoice = s.invoices.find((i) => i.id === cn.invoiceId)!;
+  cn.lines.forEach((l) =>
+    l.returns.forEach((p) => {
+      p.returnBatchId = returnToStock(s, {
+        batchId: p.batchId,
+        qty: p.qty,
+        quarantine: true,
+        reference: cn.number,
+        sourceId: cn.id,
+        counterpartyId: cn.customerId,
+        date: cn.date,
+      }).id;
+    }),
+  );
+  if (cn.returnCost)
+    ledger(s, cn.date, cn.number, 'Returned stock \u2014 ' + invoice.number, [
+      { account: 'inventory', debit: cn.returnCost },
+      { account: 'cogs', credit: cn.returnCost },
+    ]);
+  ledger(s, cn.date, cn.number, 'Credit note \u2014 ' + invoice.number, [
+    { account: 'revenue', debit: round(cn.subtotal - cn.discount) },
+    { account: 'tax', debit: cn.taxAmount },
+    { account: 'receivable', credit: cn.total },
+  ]);
+  const applied = Math.min(cn.total, invoiceBalance(invoice));
+  if (applied > 0) {
+    cn.allocations.push({ invoiceId: invoice.id, amount: applied, date: cn.date });
+    invoice.credited = round(invoice.credited + applied);
+  }
+  const remainder = round(cn.total - applied);
+  cn.status = 'Issued';
+  if (cn.settlement === 'refund' && remainder > 0)
+    refundCredit(
+      s,
+      { customerId: cn.customerId, amount: remainder, method: cn.refundMethod, date: cn.date },
+      cn.id,
+    );
+  cn.issuedAt = new Date().toISOString();
+  activity(
+    s,
+    'return',
+    'Credit note issued',
+    `${cn.number} · ${invoice.number}${cn.kind === 'return' ? '. Returned stock is in quarantine \u2014 release or write it off in Batches.' : ''}`,
+    cn.date,
+  );
+  return cn;
+}
+const paymentMethods: CustomerPayment['method'][] = [
+  'Bank transfer',
+  'Cash',
+  'Card',
+  'Cheque',
+  'Other',
+];
+const paymentCredit = (p: CustomerPayment) =>
+  p.status === 'Posted' ? round(p.amount - sum(p.allocations, (a) => a.amount) - p.refunded) : 0;
+const customerCredit = (s: Workspace, customerId: string) =>
+  round(
+    sum(
+      s.payments.filter((p) => p.customerId === customerId),
+      paymentCredit,
+    ) +
+      sum(
+        s.creditNotes.filter((cn) => cn.customerId === customerId && cn.status === 'Issued'),
+        creditAvailable,
+      ),
+  );
+const openInvoices = (s: Workspace, customerId: string) =>
+  s.invoices
+    .filter((i) => i.customerId === customerId && i.status === 'Issued' && invoiceBalance(i) > 0)
+    .sort((a, b) => a.due.localeCompare(b.due) || a.number.localeCompare(b.number));
+function creditSources(s: Workspace, customerId: string) {
+  return [
+    ...s.payments
+      .filter((p) => p.customerId === customerId && paymentCredit(p) > 0)
+      .map((p) => ({ kind: 'payment' as const, source: p, available: paymentCredit(p) })),
+    ...s.creditNotes
+      .filter(
+        (cn) => cn.customerId === customerId && cn.status === 'Issued' && creditAvailable(cn) > 0,
+      )
+      .map((cn) => ({ kind: 'credit_note' as const, source: cn, available: creditAvailable(cn) })),
+  ].sort(
+    (a, b) =>
+      a.source.date.localeCompare(b.source.date) || a.source.number.localeCompare(b.source.number),
+  );
+}
+function recordPayment(s: Workspace, input: CustomerPaymentInput): CustomerPayment {
+  required(contact(s, input.customerId)?.type === 'Customer', 'Select a customer.');
+  const amount = moneyCheck(input.amount);
+  required(amount > 0, 'Payment must be positive.');
+  const date = dateCheck(input.date);
+  required(date <= today(), 'Payment date cannot be in the future.');
+  required(paymentMethods.includes(input.method), 'Select a payment method.');
+  let remaining = amount;
+  const requested =
+    input.allocations ??
+    openInvoices(s, input.customerId)
+      .map((i) => {
+        const applied = Math.min(remaining, invoiceBalance(i));
+        remaining = round(remaining - applied);
+        return { invoiceId: i.id, amount: applied };
+      })
+      .filter((a) => a.amount > 0);
+  const seen = new Set<string>();
+  const allocations: PaymentAllocation[] = requested.map((a) => {
+    const invoice = s.invoices.find((i) => i.id === a.invoiceId);
+    required(
+      invoice?.status === 'Issued' && invoice.customerId === input.customerId,
+      'Select an issued invoice for this customer.',
+    );
+    required(!seen.has(invoice.id), 'An invoice may be allocated only once.');
+    seen.add(invoice.id);
+    const applied = moneyCheck(a.amount);
+    required(
+      applied > 0 && applied <= invoiceBalance(invoice),
+      'Payment must be positive and cannot exceed the outstanding amount.',
+    );
+    return { invoiceId: invoice.id, amount: applied, date };
+  });
+  required(
+    sum(allocations, (a) => a.amount) <= amount,
+    'Allocations cannot exceed the payment amount.',
+  );
+  const p: CustomerPayment = {
+    id: uid('pay'),
+    number: `PAY-${String(s.counters.payment++).padStart(4, '0')}`,
+    customerId: input.customerId,
+    date,
+    amount,
+    method: input.method,
+    reference: String(input.reference || '').trim(),
+    note: String(input.note || '').trim(),
+    allocations,
+    voidedAllocations: [],
+    refunded: 0,
+    status: 'Posted',
+    voidReason: '',
+    voidDate: '',
+    createdAt: new Date().toISOString(),
+    createdBy: CURRENT_USER,
+  };
+  s.payments.unshift(p);
+  allocations.forEach((a) => {
+    const invoice = s.invoices.find((i) => i.id === a.invoiceId)!;
+    invoice.paid = round(invoice.paid + a.amount);
+  });
+  ledger(s, date, p.number, 'Customer payment — ' + p.method, [
+    { account: 'cash', debit: amount },
+    { account: 'receivable', credit: amount },
+  ]);
+  activity(s, 'payment', 'Payment received', `${p.number} · ${p.method}`, date);
+  return p;
+}
+function applyCredit(
+  s: Workspace,
+  input: { customerId: string; invoiceId: string; amount?: NumericInput; date?: string },
+) {
+  const invoice = s.invoices.find((i) => i.id === input.invoiceId);
+  required(
+    invoice?.status === 'Issued' && invoice.customerId === input.customerId,
+    'Select an issued invoice for this customer.',
+  );
+  const available = customerCredit(s, input.customerId);
+  const amount =
+    input.amount === undefined
+      ? Math.min(invoiceBalance(invoice), available)
+      : moneyCheck(input.amount);
+  required(
+    amount > 0 && amount <= invoiceBalance(invoice) && amount <= available,
+    'Amount must be positive and cannot exceed the invoice balance or available credit.',
+  );
+  const date = dateCheck(input.date ?? today());
+  required(date <= today(), 'Allocation date cannot be in the future.');
+  let remaining = amount;
+  for (const { kind, source, available } of creditSources(s, input.customerId)) {
+    const taken = Math.min(remaining, available);
+    source.allocations.push({ invoiceId: invoice.id, amount: taken, date });
+    if (kind === 'payment') invoice.paid = round(invoice.paid + taken);
+    else invoice.credited = round(invoice.credited + taken);
+    remaining = round(remaining - taken);
+    if (!remaining) break;
+  }
+  return invoice;
+}
+function removeAllocation(
+  s: Workspace,
+  input: { source: 'payment' | 'credit_note'; id: string; invoiceId: string },
+) {
+  required(['payment', 'credit_note'].includes(input.source), 'Select a credit source.');
+  const source =
+    input.source === 'payment'
+      ? s.payments.find((p) => p.id === input.id && p.status === 'Posted')
+      : s.creditNotes.find((cn) => cn.id === input.id && cn.status === 'Issued');
+  required(source, 'Credit source not found.');
+  const allocations = source.allocations.filter((a) => a.invoiceId === input.invoiceId);
+  required(allocations.length, 'Allocation not found.');
+  const invoice = s.invoices.find((i) => i.id === input.invoiceId)!;
+  const field = input.source === 'payment' ? 'paid' : 'credited';
+  invoice[field] = round(invoice[field] - sum(allocations, (a) => a.amount));
+  source.allocations = source.allocations.filter((a) => a.invoiceId !== input.invoiceId);
+}
+function refundCredit(
+  s: Workspace,
+  input: { customerId: string; amount: NumericInput; method: string; date: string },
+  creditNoteId?: string,
+): Refund {
+  required(contact(s, input.customerId)?.type === 'Customer', 'Select a customer.');
+  const amount = moneyCheck(input.amount);
+  const sources = creditSources(s, input.customerId).filter(
+    (x) => !creditNoteId || (x.kind === 'credit_note' && x.source.id === creditNoteId),
+  );
+  required(
+    amount > 0 && amount <= sum(sources, (x) => x.available),
+    'Refund must be positive and cannot exceed available credit.',
+  );
+  const method = String(input.method || '').trim();
+  required(method, 'Select a refund method.');
+  const date = dateCheck(input.date);
+  required(date <= today(), 'Refund date cannot be in the future.');
+  const refund: Refund = {
+    id: uid('refund'),
+    customerId: input.customerId,
+    amount,
+    method,
+    date,
+    from: [],
+    createdBy: CURRENT_USER,
+  };
+  let remaining = amount;
+  for (const { kind, source, available } of sources) {
+    const taken = Math.min(remaining, available);
+    source.refunded = round(source.refunded + taken);
+    refund.from.push({ kind, id: source.id, amount: taken });
+    remaining = round(remaining - taken);
+    if (!remaining) break;
+  }
+  s.refunds.unshift(refund);
+  ledger(
+    s,
+    date,
+    creditNoteId ? s.creditNotes.find((cn) => cn.id === creditNoteId)!.number : refund.id,
+    'Refund — ' + method,
+    [
+      { account: 'receivable', debit: amount },
+      { account: 'cash', credit: amount },
+    ],
+  );
+  return refund;
+}
+function voidPayment(s: Workspace, id: string, reason: string, date = today()) {
+  const p = s.payments.find((p) => p.id === id);
+  required(p?.status === 'Posted', 'Only posted payments can be voided.');
+  required(p.refunded === 0, 'Payments with refunds cannot be voided.');
+  reason = String(reason || '').trim();
+  required(reason, 'Enter a void reason.');
+  dateCheck(date);
+  required(
+    date >= p.date && date <= today(),
+    'Void date must be between the payment date and today.',
+  );
+  p.voidedAllocations = p.allocations.map((a) => ({ ...a }));
+  [...p.allocations].forEach((a) => {
+    if (p.allocations.some((entry) => entry.invoiceId === a.invoiceId))
+      removeAllocation(s, { source: 'payment', id, invoiceId: a.invoiceId });
+  });
+  ledger(s, date, p.number, 'Payment voided — ' + reason, [
+    { account: 'receivable', debit: p.amount },
+    { account: 'cash', credit: p.amount },
+  ]);
+  p.status = 'Voided';
+  p.voidReason = reason;
+  p.voidDate = date;
+  return p;
+}
+
 function payInvoice(
   s: Workspace,
   id: string,
@@ -1704,13 +3198,13 @@ function payInvoice(
     date >= i.date && date <= today(),
     'Payment date must be between the invoice date and today.',
   );
-  i.paid = round(i.paid + Number(amount));
-  i.payments.push({ id: uid('payment'), amount, date, method });
-  ledger(s, date, i.number, 'Customer payment — ' + method, [
-    { account: 'cash', debit: amount },
-    { account: 'receivable', credit: amount },
-  ]);
-  activity(s, 'payment', 'Payment received', `${i.number} · ${method}`, date);
+  return recordPayment(s, {
+    customerId: i.customerId,
+    date,
+    amount,
+    method: method as CustomerPayment['method'],
+    allocations: [{ invoiceId: id, amount }],
+  });
 }
 function deleteDraft(s: Workspace, id: string) {
   required(s.invoices.find((i) => i.id === id)?.status === 'Draft', 'Only drafts can be deleted.');
@@ -1958,6 +3452,21 @@ function deleteCustomerGroup(s: Workspace, id: string) {
   s.customerGroups = s.customerGroups.filter((g) => g.id !== id);
   s.prices = s.prices.filter((e) => e.groupId !== id);
 }
+function contactInUse(s: Workspace, id: string): boolean {
+  return (
+    s.invoices.some((i) => i.customerId === id) ||
+    s.orders.some((o) => o.customerId === id) ||
+    s.deliveries.some((d) => d.customerId === id) ||
+    s.reservations.some((r) => r.customerId === id) ||
+    s.payments.some((p) => p.customerId === id) ||
+    s.refunds.some((r) => r.customerId === id) ||
+    s.creditNotes.some((cn) => cn.customerId === id) ||
+    s.prices.some((p) => p.customerId === id) ||
+    s.purchases.some((p) => p.supplierId === id) ||
+    s.receipts.some((r) => r.supplierId === id) ||
+    s.products.some((p) => p.supplierId === id)
+  );
+}
 function saveContact(s: Workspace, data: ContactInput, id?: string) {
   required(['Customer', 'Supplier'].includes(data.type), 'Select a contact type.');
   required(String(data.name || '').trim().length >= 2, 'Enter a contact name.');
@@ -2001,19 +3510,180 @@ function saveContact(s: Workspace, data: ContactInput, id?: string) {
     const old = contact(s, id);
     required(old, 'Contact not found.');
     required(
-      old.type === c.type ||
-        ![
-          ...s.invoices.map((i) => i.customerId),
-          ...s.purchases.map((p) => p.supplierId),
-          ...s.receipts.map((r) => r.supplierId),
-          ...s.products.map((p) => p.supplierId),
-          ...s.prices.map((e) => e.customerId),
-        ].includes(id),
+      old.type === c.type || !contactInUse(s, id),
       'This contact has transaction history, so its type cannot be changed.',
     );
     s.contacts = s.contacts.map((x) => (x.id === id ? c : x));
   } else s.contacts.push(c);
   return c;
+}
+// Dated source documents, rather than today's paid/credited/refunded caches, drive reports.
+function receivableEvents(
+  s: Workspace,
+  customerId: string,
+): Omit<Statement['lines'][number], 'balance'>[] {
+  const events: Omit<Statement['lines'][number], 'balance'>[] = [];
+  const add = (
+    date: string,
+    type: Statement['lines'][number]['type'],
+    reference: string,
+    description: string,
+    debit: number,
+    credit: number,
+  ) => events.push({ date, type, reference, description, debit, credit });
+  s.invoices
+    .filter((i) => i.customerId === customerId && i.status === 'Issued')
+    .forEach((i) => add(i.date, 'Invoice', i.number, `Invoice due ${i.due}`, i.total, 0));
+  s.creditNotes
+    .filter((cn) => cn.customerId === customerId && cn.status === 'Issued')
+    .forEach((cn) =>
+      add(
+        cn.date,
+        'Credit note',
+        cn.number,
+        cn.note || cn.reason.replaceAll('_', ' '),
+        0,
+        cn.total,
+      ),
+    );
+  s.payments
+    .filter((p) => p.customerId === customerId)
+    .forEach((p) => {
+      add(
+        p.date,
+        'Payment',
+        p.number,
+        `${p.method}${p.reference ? ` · ${p.reference}` : ''}`,
+        0,
+        p.amount,
+      );
+      if (p.status === 'Voided')
+        add(p.voidDate, 'Payment voided', p.number, p.voidReason, p.amount, 0);
+    });
+  s.refunds
+    .filter((r) => r.customerId === customerId)
+    .forEach((r) => {
+      const reference = r.from
+        .map((f) =>
+          f.kind === 'payment'
+            ? s.payments.find((p) => p.id === f.id)!.number
+            : s.creditNotes.find((cn) => cn.id === f.id)!.number,
+        )
+        .join(', ');
+      add(r.date, 'Refund', reference, `Refund · ${r.method}`, r.amount, 0);
+    });
+  const order = { Invoice: 0, 'Credit note': 1, Payment: 2, 'Payment voided': 3, Refund: 4 };
+  return events.sort(
+    (a, b) =>
+      a.date.localeCompare(b.date) ||
+      order[a.type] - order[b.type] ||
+      a.reference.localeCompare(b.reference),
+  );
+}
+function invoiceOpenAt(s: Workspace, invoice: Invoice, asOf: string): number {
+  if (invoice.status !== 'Issued' || invoice.date > asOf) return 0;
+  const allocated = (allocations: PaymentAllocation[]) =>
+    sum(
+      allocations.filter((a) => a.invoiceId === invoice.id && a.date <= asOf),
+      (a) => a.amount,
+    );
+  return round(
+    invoice.total -
+      sum(
+        s.payments.filter((p) => p.date <= asOf && (p.status === 'Posted' || p.voidDate > asOf)),
+        (p) => allocated(p.status === 'Voided' ? p.voidedAllocations : p.allocations),
+      ) -
+      sum(
+        s.creditNotes.filter((cn) => cn.status === 'Issued' && cn.date <= asOf),
+        (cn) => allocated(cn.allocations),
+      ),
+  );
+}
+const emptyAging = (customerId: string): AgingRow => ({
+  customerId,
+  current: 0,
+  d1_30: 0,
+  d31_60: 0,
+  d61_90: 0,
+  d90plus: 0,
+  credit: 0,
+  total: 0,
+});
+function customerAging(s: Workspace, customerId: string, asOf: string): AgingRow {
+  const row = emptyAging(customerId);
+  s.invoices
+    .filter((i) => i.customerId === customerId)
+    .forEach((i) => {
+      const open = invoiceOpenAt(s, i, asOf),
+        days = daysLeft(asOf, i.due);
+      const bucket =
+        days <= 0
+          ? 'current'
+          : days <= 30
+            ? 'd1_30'
+            : days <= 60
+              ? 'd31_60'
+              : days <= 90
+                ? 'd61_90'
+                : 'd90plus';
+      row[bucket] = round(row[bucket] + open);
+    });
+  row.total =
+    sum(
+      receivableEvents(s, customerId).filter((e) => e.date <= asOf),
+      (e) => e.debit - e.credit,
+    ) || 0;
+  // The difference is unapplied credit: allocations move it into invoice buckets without a posting.
+  row.credit = round(row.current + row.d1_30 + row.d31_60 + row.d61_90 + row.d90plus - row.total);
+  return row;
+}
+function agingReport(s: Workspace, asOf = today()): AgingRow[] {
+  dateCheck(asOf);
+  const rows = s.contacts
+    .filter((c) => c.type === 'Customer')
+    .map((c) => customerAging(s, c.id, asOf))
+    .filter((r) => r.current || r.d1_30 || r.d31_60 || r.d61_90 || r.d90plus || r.credit);
+  // An empty customerId identifies the totals row and is never a customer reference.
+  const totals = emptyAging('');
+  for (const key of ['current', 'd1_30', 'd31_60', 'd61_90', 'd90plus', 'credit', 'total'] as const)
+    totals[key] = sum(rows, (r) => r[key]);
+  return [...rows, totals];
+}
+function customerStatement(
+  s: Workspace,
+  customerId: string,
+  { from, to }: { from: string; to: string },
+): Statement {
+  required(contact(s, customerId)?.type === 'Customer', 'Select a customer.');
+  dateCheck(from);
+  dateCheck(to);
+  required(from <= to, 'Statement end date cannot be before its start date.');
+  const events = receivableEvents(s, customerId);
+  const opening =
+    sum(
+      events.filter((e) => e.date < from),
+      (e) => e.debit - e.credit,
+    ) || 0;
+  let balance = opening;
+  const lines = events
+    .filter((e) => e.date >= from && e.date <= to)
+    .map((e) => {
+      balance = round(balance + e.debit - e.credit) || 0;
+      return { ...e, balance };
+    });
+  return { opening, lines, closing: balance, aging: customerAging(s, customerId, to) };
+}
+function overdueAmount(
+  s: Workspace,
+  customerId: string,
+  graceDays: number,
+  asOf = today(),
+): number {
+  dateCheck(asOf);
+  return sum(
+    s.invoices.filter((i) => i.customerId === customerId && daysLeft(i.due, asOf) < -graceDays),
+    (i) => invoiceOpenAt(s, i, asOf),
+  );
 }
 function balances(s: Workspace, from = '', to = today()) {
   const b = Object.fromEntries(
@@ -2070,6 +3740,10 @@ function emptyWorkspace(s: Workspace): Workspace {
       count: 1,
       recall: 1,
       reservation: 1,
+      order: 1,
+      delivery: 1,
+      creditNote: 1,
+      payment: 1,
     },
     products: [],
     batches: [],
@@ -2088,11 +3762,16 @@ function emptyWorkspace(s: Workspace): Workspace {
     recalls: [],
     reorderRules: [],
     reservations: [],
+    orders: [],
+    deliveries: [],
+    creditNotes: [],
+    payments: [],
+    refunds: [],
   };
 }
 function seed(): Workspace {
   const s: Workspace = {
-    version: 2,
+    version: 3,
     createdAt: today(),
     settings: {
       company: 'Aster Pharmaceuticals',
@@ -2115,6 +3794,10 @@ function seed(): Workspace {
       count: 1,
       recall: 1,
       reservation: 1,
+      order: 1,
+      delivery: 1,
+      creditNote: 1,
+      payment: 1,
     },
     products: [],
     batches: [],
@@ -2129,6 +3812,11 @@ function seed(): Workspace {
     recalls: [],
     reorderRules: [],
     reservations: [],
+    orders: [],
+    deliveries: [],
+    creditNotes: [],
+    payments: [],
+    refunds: [],
     journal: [],
     contacts: [],
     customerGroups: [],
@@ -2742,8 +4430,8 @@ function seed(): Workspace {
       taxRate: 0,
       notes: 'Thank you for your business. Please include the invoice number with your payment.',
     });
-    issueInvoice(s, inv.id);
-    if (n < 48 || n % 3 === 0)
+    issueInvoice(s, inv.id, { reason: 'Consolidated bank remittance pending' });
+    if (![0, 5, 10].includes(n) && (n < 48 || n % 3 === 0))
       payInvoice(
         s,
         inv.id,
@@ -2751,9 +4439,20 @@ function seed(): Workspace {
         'Bank transfer',
         date > today() ? today() : shift(2, date) > today() ? today() : shift(2, date),
       );
-    else if (n % 4 === 0)
+    else if (![0, 5, 10].includes(n) && n % 4 === 0)
       payInvoice(s, inv.id, round(inv.total / 2), 'Cash', date > today() ? today() : date);
   }
+  const greenlifeInvoices = s.invoices.filter(
+    (i) => i.customerId === 'c1' && i.paid === 0 && i.date <= shift(-147),
+  );
+  recordPayment(s, {
+    customerId: 'c1',
+    date: shift(-145),
+    amount: sum(greenlifeInvoices, (i) => i.total),
+    method: 'Bank transfer',
+    reference: 'GL consolidated remittance',
+    allocations: greenlifeInvoices.map((i) => ({ invoiceId: i.id, amount: i.total })),
+  });
   for (let n = 0; n < 6; n++) {
     addExpense(s, {
       date: shift(-145 + n * 28),
@@ -3061,12 +4760,239 @@ function seed(): Workspace {
     ['p4', 'box', 4.9],
   ] as const)
     savePrice(s, { productId, unit, price, customerId: 'c1', note: 'Agreed volume price.' });
+  const makeOrder = (
+    customerId: string,
+    productId: string,
+    qty: number,
+    date = today(),
+    validUntil = shift(14, date),
+  ) =>
+    saveOrder(s, {
+      customerId,
+      date,
+      validUntil,
+      requestedDate: shift(3),
+      fulfilment: 'delivery',
+      lines: [{ productId, qty }],
+    });
+  makeOrder('c5', 'p1', 20);
+  makeOrder('c3', 'p3', 12, shift(-20), shift(-1));
+  const greenlife = makeOrder('c1', 'p3', 2, shift(-3));
+  confirmOrder(s, greenlife.id);
+  const backorder = makeOrder('c5', 'p2', free(s, 'p2', { customerId: 'c5' }) + 25);
+  confirmOrder(s, backorder.id);
+  const wellness = makeOrder('c2', 'p3', 8);
+  confirmOrder(s, wellness.id, { override: { reason: 'Owner approved, cheque replaced' } });
+  const cancelled = makeOrder('c3', 'p1', 10);
+  cancelOrder(s, cancelled.id, 'Customer chose a different pack size.');
+  const orderDelivery = (order: SalesOrder) => {
+    const line = order.lines[0];
+    const batch = eligibleBatches(s, line.productId, {
+      customerId: order.customerId,
+      allowShortDated: order.allowShortDated,
+    })[0];
+    required(batch, 'Seed delivery requires eligible stock.');
+    return createDelivery(s, { orderId: order.id, warehouseId: batch.warehouseId });
+  };
+  const collected = orderDelivery(greenlife);
+  dispatchDelivery(s, collected.id, { driver: 'Dara', date: shift(-3) });
+  confirmDelivered(s, collected.id, { receivedBy: 'Greenlife receiving desk' });
+  const partial = orderDelivery(backorder);
+  dispatchDelivery(s, partial.id, { driver: 'Sokha' });
+  confirmDelivered(s, partial.id, { receivedBy: 'Sunrise pharmacy stores' });
+  orderDelivery(wellness);
+  const outOrder = makeOrder('c1', 'p4', 1);
+  confirmOrder(s, outOrder.id);
+  const draftDelivery = orderDelivery(outOrder);
+  dispatchDelivery(s, draftDelivery.id, { driver: 'Dara' });
+  createInvoiceFromDeliveries(s, {
+    deliveryIds: [draftDelivery.id],
+    notes: 'Awaiting billing review.',
+  });
+  const returnedOrder = makeOrder('c1', 'p4', 1);
+  confirmOrder(s, returnedOrder.id);
+  const returned = orderDelivery(returnedOrder);
+  dispatchDelivery(s, returned.id, { driver: 'Sokha' });
+  markNotDelivered(s, returned.id, 'Customer closed, redeliver tomorrow');
+  const monthlyDelivery = (date: string, productId: string) => {
+    const order = makeOrder('c5', productId, 1, date, shift(14));
+    confirmOrder(s, order.id);
+    const delivery = orderDelivery(order);
+    dispatchDelivery(s, delivery.id, { date, driver: 'Sokha' });
+    confirmDelivered(s, delivery.id, { receivedBy: 'Sunrise pharmacy stores' });
+    return delivery;
+  };
+  const lastMonth = shift(-1, today().slice(0, 7) + '-01');
+  const monthly = [monthlyDelivery(shift(-1, lastMonth), 'p3'), monthlyDelivery(lastMonth, 'p4')];
+  issueInvoice(
+    s,
+    createInvoiceFromDeliveries(s, { deliveryIds: monthly.map((d) => d.id), date: lastMonth }).id,
+  );
+  const paidReturnInvoice = s.invoices.find(
+    (i) =>
+      i.status === 'Issued' &&
+      i.paid === i.total &&
+      i.customerId === 'c3' &&
+      i.lines.every((l) => product(s, l.productId)!.active) &&
+      !deliveriesOf(s, i)
+        .flatMap((d) => d.lines)
+        .flatMap((l) => l.picks)
+        .some((p) =>
+          isRecalled(
+            s,
+            s.batches.find((b) => b.id === p.batchId)!,
+          ),
+        ),
+  )!;
+  const refund = issueCreditNote(
+    s,
+    saveCreditNote(s, {
+      invoiceId: paidReturnInvoice.id,
+      kind: 'return',
+      reason: 'wrong_prescription',
+      settlement: 'refund',
+      refundMethod: 'Cash',
+      lines: [{ invoiceLineIndex: 0, qty: 1 }],
+    }).id,
+  );
+  refund.lines.flatMap((l) => l.returns).forEach((p) => setQuarantine(s, p.returnBatchId!, false));
+  const unpaidInvoice = s.invoices.find(
+    (i) =>
+      i.status === 'Issued' &&
+      i.paid === 0 &&
+      i.customerId !== 'c1' &&
+      i.lines[0].qty > 1 &&
+      !creditNotePicks(s, i, i.lines[0].productId).some((p) =>
+        s.batches.some(
+          (b) =>
+            b.productId === i.lines[0].productId &&
+            b.code === p.lotCode &&
+            b.quarantined &&
+            b.qty > 0,
+        ),
+      ),
+  )!;
+  const damaged = issueCreditNote(
+    s,
+    saveCreditNote(s, {
+      invoiceId: unpaidInvoice.id,
+      kind: 'return',
+      reason: 'damaged',
+      settlement: 'credit',
+      lines: [{ invoiceLineIndex: 0, qty: 1 }],
+    }).id,
+  );
+  damaged.lines
+    .flatMap((l) => l.returns)
+    .forEach((p) =>
+      adjustStock(s, {
+        batchId: p.returnBatchId!,
+        qty: -p.qty,
+        reason: 'damaged',
+        note: 'Returned packaging was damaged.',
+      }),
+    );
+  const correction = issueCreditNote(
+    s,
+    saveCreditNote(s, {
+      invoiceId: paidReturnInvoice.id,
+      kind: 'correction',
+      reason: 'price_error',
+      settlement: 'credit',
+      lines: [{ invoiceLineIndex: 0, qty: 1, price: round(paidReturnInvoice.lines[0].price / 2) }],
+    }).id,
+  );
+  saveCreditNote(s, {
+    invoiceId: paidReturnInvoice.id,
+    kind: 'correction',
+    reason: 'price_error',
+    settlement: 'credit',
+    lines: [{ invoiceLineIndex: 0, qty: 1, price: 0.1 }],
+  });
+  const correctionTarget = openInvoices(s, correction.customerId)[0];
+  const correctionApplied = Math.min(round(correction.total / 2), invoiceBalance(correctionTarget));
+  applyCredit(s, {
+    customerId: correction.customerId,
+    invoiceId: correctionTarget.id,
+    amount: correctionApplied,
+  });
+  refundCredit(s, {
+    customerId: correction.customerId,
+    amount: creditAvailable(correction),
+    method: 'Bank transfer',
+    date: today(),
+  });
+  const cheque = recordPayment(s, {
+    customerId: 'c2',
+    amount: 120,
+    method: 'Cheque',
+    date: today(),
+    reference: 'WMC-0042',
+  });
+  voidPayment(s, cheque.id, 'Cheque returned unpaid');
+  const deposit = recordPayment(s, {
+    customerId: 'c4',
+    amount: product(s, 'p3')!.price,
+    method: 'Bank transfer',
+    date: today(),
+    reference: 'Lotus pickup deposit',
+    allocations: [],
+  });
+  const prepaidOrder = makeOrder('c4', 'p3', 1);
+  confirmOrder(s, prepaidOrder.id, { override: { reason: 'Prepaid pickup approved by owner' } });
+  const prepaidDelivery = orderDelivery(prepaidOrder);
+  dispatchDelivery(s, prepaidDelivery.id, { driver: 'Dara' });
+  confirmDelivered(s, prepaidDelivery.id, { receivedBy: 'Lotus Health receiving desk' });
+  issueInvoice(s, createInvoiceFromDeliveries(s, { deliveryIds: [prepaidDelivery.id] }).id);
+  required(paymentCredit(deposit) === 0, 'Seed deposit must be fully applied.');
+  for (const [bucket, days] of [
+    ['current', -10],
+    ['d1_30', 10],
+    ['d31_60', 45],
+    ['d61_90', 75],
+    ['d90plus', 120],
+  ] as const) {
+    if (agingReport(s).at(-1)![bucket] > 0) continue;
+    const invoice = createInvoice(s, {
+      customerId: 'c2',
+      date: shift(-Math.max(0, days + 30)),
+      due: shift(-days),
+      lines: [{ productId: 'p3', qty: 1, price: round(customerCredit(s, 'c2') + 25) }],
+      notes: 'Monthly account reconciliation awaiting remittance.',
+    });
+    issueInvoice(s, invoice.id, {
+      reason: 'Historical account balance approved for reconciliation',
+    });
+  }
+  if (!agingReport(s).at(-1)!.credit) {
+    const invoice = s.invoices.find(
+      (i) =>
+        i.status === 'Issued' &&
+        i.paid === i.total &&
+        i.lines[0].price >= 1 &&
+        !s.creditNotes.some((cn) => cn.invoiceId === i.id),
+    )!;
+    issueCreditNote(
+      s,
+      saveCreditNote(s, {
+        invoiceId: invoice.id,
+        kind: 'correction',
+        reason: 'price_error',
+        settlement: 'credit',
+        note: 'Agreed price correction kept for the next order.',
+        lines: [{ invoiceLineIndex: 0, qty: 1, price: 1 }],
+      }).id,
+    );
+  }
   return s;
 }
 function migrate(raw: unknown): Workspace {
   required(typeof raw === 'object' && raw !== null, 'This is not a supported Aster backup.');
   const legacy = raw as { version?: number };
-  required(legacy.version === 1 || legacy.version === 2, 'This is not a supported Aster backup.');
+  required(
+    legacy.version === 1 || legacy.version === 2 || legacy.version === 3,
+    'This is not a supported Aster backup.',
+  );
   const s = raw as Workspace;
   required(Array.isArray(s.batches), 'Backup is missing batches.');
   required(s.counters, 'Backup settings are missing.');
@@ -3098,6 +5024,10 @@ function migrate(raw: unknown): Workspace {
   if (s.reorderRules === undefined) s.reorderRules = [];
   if (s.reservations === undefined) s.reservations = [];
   if (s.counters.reservation === undefined) s.counters.reservation = 1;
+  if (s.creditNotes === undefined) s.creditNotes = [];
+  if (s.counters.creditNote === undefined) s.counters.creditNote = 1;
+  if (s.orders === undefined) s.orders = [];
+  if (s.counters.order === undefined) s.counters.order = 1;
   if (s.customerGroups === undefined) s.customerGroups = [];
   if (s.prices === undefined) s.prices = [];
   if (Array.isArray(s.customerGroups))
@@ -3118,7 +5048,9 @@ function migrate(raw: unknown): Workspace {
     });
   if (Array.isArray(s.invoices))
     s.invoices.forEach((i) => {
+      if (i.credited === undefined) i.credited = 0;
       if (i.allowShortDated === undefined) i.allowShortDated = false;
+      if (i.orderId === undefined) i.orderId = undefined;
     });
   if (Array.isArray(s.warehouses))
     s.warehouses.forEach((w) => {
@@ -3150,7 +5082,147 @@ function migrate(raw: unknown): Workspace {
           });
       });
   }
-  s.version = 2;
+  if (s.deliveries === undefined) s.deliveries = [];
+  if (s.counters.delivery === undefined) s.counters.delivery = 1;
+  if (legacy.version !== 3 && Array.isArray(s.invoices))
+    [...s.invoices].reverse().forEach((invoice) => {
+      const old = invoice as Invoice & {
+        allocations?: {
+          batchId: string;
+          code: string;
+          warehouseId: string;
+          productId: string;
+          qty: number;
+          cost: number;
+        }[];
+        cogs?: number;
+      };
+      if (invoice.deliveryIds === undefined) {
+        invoice.deliveryIds = [];
+        if (invoice.status === 'Issued') {
+          required(Array.isArray(old.allocations), 'Invalid legacy invoice allocations.');
+          const remaining = old.allocations.map((a) => ({ ...a, remainingQty: a.qty }));
+          const lines = invoice.lines.map((line) => {
+            let need = line.qty * line.factor;
+            const picks: DeliveryPick[] = [];
+            for (const allocation of remaining.filter((a) => a.productId === line.productId)) {
+              const take = Math.min(need, allocation.remainingQty);
+              if (!take) continue;
+              const batch = s.batches.find((b) => b.id === allocation.batchId);
+              required(batch, 'Unknown legacy invoice batch allocation.');
+              picks.push({
+                batchId: allocation.batchId,
+                warehouseId: allocation.warehouseId,
+                lotCode: allocation.code,
+                expiry: batch.expiry,
+                qty: take,
+                cost: allocation.cost,
+              });
+              need -= take;
+              allocation.remainingQty -= take;
+            }
+            required(need === 0, 'Legacy invoice allocations do not match its base quantities.');
+            return {
+              id: uid('dl'),
+              productId: line.productId,
+              name: line.name,
+              sku: line.sku,
+              unit: line.unit,
+              factor: line.factor,
+              qty: line.qty,
+              price: line.price,
+              picks,
+            };
+          });
+          required(
+            remaining.every((a) => a.remainingQty === 0),
+            'Legacy invoice allocations do not match its base quantities.',
+          );
+          const delivery = newDelivery(s, {
+            customerId: invoice.customerId,
+            method: 'pickup',
+            address: contact(s, invoice.customerId)?.address || '',
+            lines,
+          });
+          Object.assign(delivery, {
+            legacy: true,
+            status: 'Delivered',
+            date: invoice.date,
+            receivedBy: contact(s, invoice.customerId)?.name || '',
+            cost: old.cogs,
+            invoiceId: invoice.id,
+            dispatchedAt: new Date(invoice.date + 'T12:00:00').toISOString(),
+            dispatchedBy: CURRENT_USER,
+            deliveredAt: new Date(invoice.date + 'T12:00:00').toISOString(),
+          });
+          invoice.deliveryIds = [delivery.id];
+        }
+      }
+      delete old.allocations;
+      delete old.cogs;
+    });
+  if (s.payments === undefined) s.payments = [];
+  if (s.refunds === undefined) s.refunds = [];
+  if (s.counters.payment === undefined) s.counters.payment = 1;
+  if (Array.isArray(s.payments) && Array.isArray(s.invoices))
+    [...s.invoices].reverse().forEach((invoice) => {
+      const old = invoice as Invoice & {
+        payments?: { date: string; amount: number; method: CustomerPayment['method'] }[];
+      };
+      if (old.payments !== undefined) {
+        required(Array.isArray(old.payments), 'Invalid legacy invoice payments.');
+        old.payments.forEach((p) =>
+          s.payments.push({
+            id: uid('pay'),
+            number: `PAY-${String(s.counters.payment++).padStart(4, '0')}`,
+            customerId: invoice.customerId,
+            date: p.date,
+            amount: p.amount,
+            method: p.method,
+            reference: '',
+            note: '',
+            allocations: [{ invoiceId: invoice.id, amount: p.amount, date: p.date }],
+            voidedAllocations: [],
+            refunded: 0,
+            status: 'Posted',
+            voidReason: '',
+            voidDate: '',
+            legacy: true,
+            createdAt: new Date(p.date + 'T12:00:00').toISOString(),
+            createdBy: CURRENT_USER,
+          }),
+        );
+        delete old.payments;
+      }
+    });
+  if (Array.isArray(s.payments))
+    s.payments.forEach((p) => {
+      if (p.voidedAllocations === undefined) p.voidedAllocations = [];
+    });
+  if (Array.isArray(s.creditNotes) && Array.isArray(s.refunds))
+    s.creditNotes.forEach((cn) => {
+      if (Array.isArray(cn.allocations))
+        cn.allocations.forEach((a) => {
+          if (a.date === undefined) a.date = cn.date;
+        });
+      if (
+        cn.refunded > 0 &&
+        !s.refunds.some(
+          (r) =>
+            Array.isArray(r.from) && r.from.some((f) => f.kind === 'credit_note' && f.id === cn.id),
+        )
+      )
+        s.refunds.push({
+          id: uid('refund'),
+          date: cn.date,
+          customerId: cn.customerId,
+          amount: cn.refunded,
+          method: cn.refundMethod || 'Other',
+          from: [{ kind: 'credit_note', id: cn.id, amount: cn.refunded }],
+          createdBy: CURRENT_USER,
+        });
+    });
+  s.version = 3;
   return s;
 }
 function validateBackup(value: unknown): Workspace {
@@ -3175,6 +5247,11 @@ function validateBackup(value: unknown): Workspace {
     'reservations',
     'customerGroups',
     'prices',
+    'orders',
+    'deliveries',
+    'creditNotes',
+    'payments',
+    'refunds',
   ])
     required(Array.isArray(s[key as keyof Workspace]), 'Backup is missing ' + key + '.');
   required(s.settings && s.counters, 'Backup settings are missing.');
@@ -3193,6 +5270,11 @@ function validateBackup(value: unknown): Workspace {
       'reservations',
       'customerGroups',
       'prices',
+      'orders',
+      'deliveries',
+      'creditNotes',
+      'payments',
+      'refunds',
     ] as const
   ).forEach((key) => {
     ids[key] = new Set();
@@ -3229,6 +5311,121 @@ function validateBackup(value: unknown): Workspace {
   const reorderPairs = new Set<string>();
   s.prices.forEach((entry) => validatePrice(s, entry));
   const reservationNumbers = new Set<string>();
+  const orderReservations = new Set<string>();
+  const orderNumbers = new Set<string>();
+  s.orders.forEach((o) => {
+    required(
+      contact(s, o.customerId)?.type === 'Customer' &&
+        ['Quote', 'Confirmed', 'Done', 'Cancelled'].includes(o.status) &&
+        Array.isArray(o.lines) &&
+        o.lines.length,
+      'Invalid order in backup.',
+    );
+    required(
+      typeof o.number === 'string' && /^SO-\d{4,}$/.test(o.number) && !orderNumbers.has(o.number),
+      'Invalid or duplicate order number.',
+    );
+    orderNumbers.add(o.number);
+    required(
+      Number(o.number.slice(3)) < s.counters.order,
+      'Order counter must exceed existing order numbers.',
+    );
+    dateCheck(o.date);
+    dateCheck(o.requestedDate);
+    required(o.date <= today() && o.requestedDate >= o.date, 'Invalid order dates.');
+    if (o.status === 'Quote' || o.validUntil !== undefined) {
+      dateCheck(o.validUntil!);
+      required(o.validUntil! >= o.date, 'Valid until must be on or after the order date.');
+    }
+    required(
+      o.status !== 'Cancelled' || (typeof o.cancelReason === 'string' && o.cancelReason.trim()),
+      'Cancelled orders require a cancellation reason.',
+    );
+    required(
+      ['delivery', 'pickup'].includes(o.fulfilment) &&
+        typeof o.deliveryAddress === 'string' &&
+        typeof o.notes === 'string' &&
+        typeof o.allowShortDated === 'boolean',
+      'Invalid order details.',
+    );
+    required(
+      typeof o.createdBy === 'string' &&
+        o.createdBy.trim() &&
+        typeof o.createdAt === 'string' &&
+        !isNaN(new Date(o.createdAt).getTime()),
+      'Invalid order creation audit.',
+    );
+    if (o.status === 'Confirmed' || o.status === 'Done')
+      required(
+        typeof o.confirmedBy === 'string' &&
+          o.confirmedBy.trim() &&
+          typeof o.confirmedAt === 'string' &&
+          !isNaN(new Date(o.confirmedAt).getTime()),
+        'Invalid order confirmation audit.',
+      );
+    if (o.status === 'Done' || o.status === 'Cancelled')
+      required(
+        typeof o.closedAt === 'string' && !isNaN(new Date(o.closedAt).getTime()),
+        'Closed orders require a valid closedAt.',
+      );
+    required(
+      typeof o.discountPercent === 'number' &&
+        moneyCheck(o.discountPercent) === o.discountPercent &&
+        o.discountPercent <= 100 &&
+        typeof o.taxRate === 'number' &&
+        moneyCheck(o.taxRate) === o.taxRate &&
+        o.taxRate <= 100,
+      'Invalid order discount or tax rate.',
+    );
+    const lineIds = new Set<string>();
+    o.lines.forEach((l) => {
+      required(
+        typeof l.id === 'string' && l.id && !lineIds.has(l.id),
+        'Invalid or duplicate order line identifier.',
+      );
+      lineIds.add(l.id);
+      required(
+        ids.products.has(l.productId) && typeof l.name === 'string' && typeof l.sku === 'string',
+        'Unknown order product.',
+      );
+      qtyCheck(l.qty);
+      moneyCheck(l.price);
+      required(
+        units.includes(l.unit) &&
+          Number.isSafeInteger(l.factor) &&
+          l.factor >= 1 &&
+          Number.isSafeInteger(l.qty * l.factor),
+        'Invalid order line unit or factor.',
+      );
+      required(
+        Number.isSafeInteger(l.cancelledQty) &&
+          l.cancelledQty >= 0 &&
+          l.cancelledQty <= l.qty &&
+          deliveredQty(s, o, l.id) <= l.qty - l.cancelledQty,
+        'Invalid order cancelled or delivered quantity.',
+      );
+    });
+    if (o.creditOverride !== undefined) {
+      const c = o.creditOverride;
+      required(
+        c &&
+          typeof c.by === 'string' &&
+          c.by.trim() &&
+          typeof c.reason === 'string' &&
+          c.reason.trim().length >= 5 &&
+          typeof c.at === 'string' &&
+          !isNaN(new Date(c.at).getTime()) &&
+          Array.isArray(c.reasons) &&
+          c.reasons.every((r) => typeof r === 'string'),
+        'Backup contains an invalid credit override.',
+      );
+    }
+    required(
+      o.status !== 'Done' || o.lines.every((l) => openQty(s, o, l.id) === 0),
+      'Done orders cannot have open quantities.',
+    );
+    orderTotals(o);
+  });
   s.reservations.forEach((r) => {
     required(
       ids.products.has(r.productId) && contact(s, r.customerId)?.type === 'Customer',
@@ -3237,7 +5434,7 @@ function validateBackup(value: unknown): Workspace {
     required(
       Number.isSafeInteger(r.qty) &&
         r.qty > 0 &&
-        ['hold', 'invoice'].includes(r.source) &&
+        ['hold', 'invoice', 'sales_order'].includes(r.source) &&
         ['Active', 'Released', 'Fulfilled'].includes(r.status) &&
         typeof r.number === 'string' &&
         /^RSV-\d{4,}$/.test(r.number) &&
@@ -3253,6 +5450,25 @@ function validateBackup(value: unknown): Workspace {
     if (r.source === 'hold') {
       dateCheck(r.expires!);
       required(r.sourceId === undefined, 'Backup contains an invalid hold reference.');
+    } else if (r.source === 'sales_order') {
+      const order = s.orders.find((o) => o.id === r.sourceId);
+      required(
+        order && order.customerId === r.customerId,
+        'Backup contains an invalid reservation order.',
+      );
+      required(
+        r.status !== 'Active' || order.status === 'Confirmed',
+        'Active order reservations require a Confirmed order.',
+      );
+      required(r.expires === undefined, 'Order reservations cannot have an expiry.');
+      if (r.status === 'Active') {
+        const key = JSON.stringify([r.sourceId, r.productId]);
+        required(
+          !orderReservations.has(key),
+          'Backup contains duplicate Active order reservations.',
+        );
+        orderReservations.add(key);
+      }
     } else {
       const invoice = s.invoices.find((i) => i.id === r.sourceId);
       // Released history survives draft deletion; live promises always need an invoice.
@@ -3349,7 +5565,13 @@ function validateBackup(value: unknown): Workspace {
       Number.isSafeInteger(s.counters.recall) &&
       s.counters.recall > 0 &&
       Number.isSafeInteger(s.counters.reservation) &&
-      s.counters.reservation > 0,
+      s.counters.reservation > 0 &&
+      Number.isSafeInteger(s.counters.order) &&
+      s.counters.order > 0 &&
+      Number.isSafeInteger(s.counters.delivery) &&
+      s.counters.delivery > 0 &&
+      Number.isSafeInteger(s.counters.creditNote) &&
+      s.counters.creditNote > 0,
     'Invalid record counters in backup.',
   );
   s.products.forEach((p) => required(Array.isArray(p.packs), 'Product packaging is missing.'));
@@ -3407,9 +5629,15 @@ function validateBackup(value: unknown): Workspace {
     dateCheck(m.date);
     moneyCheck(m.unitCost);
     required(
-      ['opening', 'receipt', 'sale', 'transfer_out', 'transfer_in', 'adjustment'].includes(
-        m.type,
-      ) &&
+      [
+        'opening',
+        'receipt',
+        'sale',
+        'return',
+        'transfer_out',
+        'transfer_in',
+        'adjustment',
+      ].includes(m.type) &&
         typeof m.reference === 'string' &&
         m.reference.length > 0 &&
         typeof m.user === 'string' &&
@@ -3569,14 +5797,206 @@ function validateBackup(value: unknown): Workspace {
       'Backup contains an unbalanced journal.',
     );
   });
+  const deliveryNumbers = new Set<string>();
+  s.deliveries.forEach((d) => {
+    required(
+      contact(s, d.customerId)?.type === 'Customer' &&
+        ['Picking', 'Dispatched', 'Delivered', 'Returned', 'Cancelled'].includes(d.status) &&
+        ['delivery', 'pickup'].includes(d.method) &&
+        Array.isArray(d.lines) &&
+        d.lines.length,
+      'Invalid delivery in backup.',
+    );
+    required(
+      typeof d.number === 'string' &&
+        /^DN-\d{4,}$/.test(d.number) &&
+        !deliveryNumbers.has(d.number) &&
+        Number(d.number.slice(3)) < s.counters.delivery,
+      'Invalid delivery number or counter.',
+    );
+    deliveryNumbers.add(d.number);
+    required(!d.warehouseId || ids.warehouses.has(d.warehouseId), 'Unknown delivery warehouse.');
+    required(
+      ['address', 'driver', 'receivedBy', 'returnReason', 'createdAt', 'createdBy'].every(
+        (key) => typeof d[key as 'address'] === 'string',
+      ) &&
+        d.createdBy.trim() &&
+        !isNaN(new Date(d.createdAt).getTime()),
+      'Invalid delivery fields.',
+    );
+    required(
+      d.legacy === undefined ||
+        (d.legacy === true &&
+          d.method === 'pickup' &&
+          d.status === 'Delivered' &&
+          !d.orderId &&
+          !!d.invoiceId),
+      'Invalid legacy delivery flag.',
+    );
+    required(
+      d.status !== 'Delivered' || d.receivedBy.trim(),
+      'Delivered deliveries require receivedBy.',
+    );
+    required(
+      d.status !== 'Returned' || d.returnReason.trim(),
+      'Returned deliveries require returnReason.',
+    );
+    const dispatched = ['Dispatched', 'Delivered', 'Returned'].includes(d.status);
+    if (dispatched) {
+      dateCheck(d.date!);
+      required(
+        d.date! <= today() &&
+          typeof d.dispatchedBy === 'string' &&
+          d.dispatchedBy.trim() &&
+          typeof d.dispatchedAt === 'string' &&
+          !isNaN(new Date(d.dispatchedAt).getTime()),
+        'Invalid delivery dispatch audit.',
+      );
+    }
+    if (d.status === 'Delivered')
+      required(
+        typeof d.deliveredAt === 'string' && !isNaN(new Date(d.deliveredAt).getTime()),
+        'Invalid deliveredAt.',
+      );
+    const linked = s.invoices.filter(
+      (i) => Array.isArray(i.deliveryIds) && i.deliveryIds.includes(d.id),
+    );
+    required(
+      linked.length <= 1 &&
+        (d.invoiceId
+          ? linked.length === 1 && linked[0].id === d.invoiceId && linked[0].status === 'Issued'
+          : linked.every((i) => i.status === 'Draft')),
+      'Delivery invoice links are inconsistent.',
+    );
+    const order = d.orderId ? s.orders.find((o) => o.id === d.orderId) : undefined;
+    required(!d.orderId || (order && order.customerId === d.customerId), 'Unknown delivery order.');
+    const lineIds = new Set<string>();
+    d.lines.forEach((l) => {
+      required(
+        l.id &&
+          !lineIds.has(l.id) &&
+          ids.products.has(l.productId) &&
+          typeof l.name === 'string' &&
+          typeof l.sku === 'string' &&
+          Array.isArray(l.picks),
+        'Invalid delivery line.',
+      );
+      lineIds.add(l.id);
+      qtyCheck(l.qty);
+      moneyCheck(l.price);
+      required(
+        units.includes(l.unit) &&
+          Number.isSafeInteger(l.factor) &&
+          l.factor >= 1 &&
+          Number.isSafeInteger(l.qty * l.factor),
+        'Invalid delivery line unit or factor.',
+      );
+      if (order) {
+        required(
+          typeof l.orderLineId === 'string' && l.orderLineId,
+          'Invalid delivery order line.',
+        );
+        if (['Dispatched', 'Delivered'].includes(d.status))
+          required(
+            order.lines.some(
+              (ol) =>
+                ol.id === l.orderLineId &&
+                ol.productId === l.productId &&
+                ol.unit === l.unit &&
+                ol.factor === l.factor,
+            ),
+            'Invalid delivery order line.',
+          );
+      } else
+        required(l.orderLineId === undefined, 'Direct delivery cannot reference an order line.');
+      required(
+        l.picks.reduce((n, p) => n + p.qty, 0) === l.qty * l.factor,
+        'Delivery picks do not match its base quantity.',
+      );
+      const batchIds = new Set<string>();
+      l.picks.forEach((p) => {
+        const batch = s.batches.find((b) => b.id === p.batchId);
+        required(
+          batch &&
+            batch.productId === l.productId &&
+            batch.warehouseId === p.warehouseId &&
+            batch.code === p.lotCode &&
+            batch.expiry === p.expiry &&
+            (!d.warehouseId || p.warehouseId === d.warehouseId) &&
+            (d.legacy || !batchIds.has(p.batchId)),
+          'Invalid delivery pick batch.',
+        );
+        batchIds.add(p.batchId);
+        qtyCheck(p.qty);
+        moneyCheck(p.cost);
+      });
+    });
+    const picks = d.lines.flatMap((l) => l.picks);
+    required(
+      typeof d.cost === 'number' &&
+        moneyCheck(d.cost) === d.cost &&
+        d.cost === (dispatched ? sum(picks, (p) => p.qty * p.cost) : 0),
+      'Delivery costs are inconsistent.',
+    );
+    if (dispatched && !d.legacy) {
+      const sales = s.stockMoves.filter((m) => m.sourceId === d.id && m.type === 'sale');
+      const remaining = [...sales];
+      picks.forEach((p) => {
+        const index = remaining.findIndex(
+          (m) =>
+            m.batchId === p.batchId &&
+            m.qty === -p.qty &&
+            m.unitCost === p.cost &&
+            m.reference === d.number &&
+            m.counterpartyId === d.customerId &&
+            m.date === d.date,
+        );
+        required(index !== -1, 'Delivery sale moves do not match its picks.');
+        remaining.splice(index, 1);
+      });
+      required(!remaining.length, 'Delivery sale moves do not match its picks.');
+      if (d.status === 'Returned') {
+        const returns = s.stockMoves.filter((m) => m.sourceId === d.id && m.type === 'return');
+        const remaining = [...returns];
+        picks.forEach((p) => {
+          const original = s.batches.find((b) => b.id === p.batchId)!;
+          const index = remaining.findIndex((m) => {
+            const twin = s.batches.find((b) => b.id === m.batchId);
+            return (
+              twin &&
+              twin.productId === original.productId &&
+              twin.code === original.code &&
+              twin.expiry === original.expiry &&
+              twin.cost === p.cost &&
+              twin.warehouseId === p.warehouseId &&
+              m.qty === p.qty &&
+              m.unitCost === p.cost &&
+              m.reference === d.number &&
+              m.counterpartyId === d.customerId
+            );
+          });
+          required(index !== -1, 'Delivery return moves do not match its picks.');
+          remaining.splice(index, 1);
+        });
+        required(!remaining.length, 'Delivery return moves do not match its picks.');
+      }
+    }
+  });
+  s.orders.forEach((o) =>
+    o.lines.forEach((l) =>
+      required(
+        deliveredQty(s, o, l.id) <= l.qty - l.cancelledQty,
+        'Order delivered quantity exceeds its open quantity.',
+      ),
+    ),
+  );
   s.invoices.forEach((i) => {
     required(
       contact(s, i.customerId)?.type === 'Customer' &&
         Array.isArray(i.lines) &&
         i.lines.length &&
         ['Draft', 'Issued'].includes(i.status) &&
-        Array.isArray(i.payments) &&
-        Array.isArray(i.allocations),
+        Array.isArray(i.deliveryIds),
       'Invalid invoice in backup.',
     );
     dateCheck(i.date);
@@ -3599,7 +6019,26 @@ function validateBackup(value: unknown): Workspace {
     }
     moneyCheck(i.total);
     moneyCheck(i.paid);
-    required(i.paid <= i.total && i.paid >= 0, 'Invalid invoice payment balance.');
+    required(
+      Number.isFinite(i.credited) &&
+        i.credited >= 0 &&
+        round(i.credited) === i.credited &&
+        i.paid >= 0 &&
+        round(i.total - i.paid - i.credited) >= 0,
+      'Invalid invoice payment balance.',
+    );
+    required(
+      i.credited ===
+        sum(
+          s.creditNotes.filter((cn) => cn.status === 'Issued'),
+          (cn) =>
+            sum(
+              cn.allocations.filter((a) => a.invoiceId === i.id),
+              (a) => a.amount,
+            ),
+        ),
+      'Invoice credit notes do not match the credited balance.',
+    );
     i.lines.forEach((l) => {
       required(
         ids.products.has(l.productId) && typeof l.name === 'string' && typeof l.sku === 'string',
@@ -3621,41 +6060,333 @@ function validateBackup(value: unknown): Workspace {
       'Invoice totals do not match its items.',
     );
     required(
-      sum(i.payments, (p) => p.amount) === i.paid,
+      sum(
+        s.payments.filter((p) => p.status === 'Posted'),
+        (p) =>
+          sum(
+            p.allocations.filter((a) => a.invoiceId === i.id),
+            (a) => a.amount,
+          ),
+      ) === i.paid,
       'Invoice payments do not match the paid balance.',
     );
-    i.payments.forEach((p) => {
-      moneyCheck(p.amount);
-      dateCheck(p.date);
-    });
-    i.allocations.forEach((a) => {
-      required(
-        ids.batches.has(a.batchId) &&
-          ids.products.has(a.productId) &&
-          ids.warehouses.has(a.warehouseId),
-        'Unknown invoice batch allocation.',
-      );
-      qtyCheck(a.qty);
-      moneyCheck(a.cost);
-    });
-    if (i.status === 'Issued') {
-      required(
-        sum(i.allocations, (a) => a.qty * a.cost) === i.cogs,
-        'Invoice batch costs are inconsistent.',
-      );
-      const productIds = new Set([
-        ...i.lines.map((l) => l.productId),
-        ...i.allocations.map((a) => a.productId),
-      ]);
-      productIds.forEach((id) =>
-        required(
-          i.allocations.filter((a) => a.productId === id).reduce((n, a) => n + a.qty, 0) ===
-            i.lines.filter((l) => l.productId === id).reduce((n, l) => n + l.qty * l.factor, 0),
-          'Invoice allocations do not match its base quantities.',
+    required(
+      new Set(i.deliveryIds).size === i.deliveryIds.length,
+      'A delivery may appear only once on an invoice.',
+    );
+    const deliveries = deliveriesOf(s, i);
+    required(
+      deliveries.length === i.deliveryIds.length &&
+        deliveries.every(
+          (d) =>
+            (i.status === 'Draft' ? !d.invoiceId : d.invoiceId === i.id) &&
+            d.customerId === i.customerId &&
+            ['Dispatched', 'Delivered'].includes(d.status),
         ),
+      'Invoice delivery links are inconsistent.',
+    );
+    required(
+      i.orderId === undefined ||
+        (typeof i.orderId === 'string' &&
+          ids.orders.has(i.orderId) &&
+          deliveries.length > 0 &&
+          deliveries.every((d) => d.orderId === i.orderId)),
+      'Invoice order does not match its deliveries.',
+    );
+    const orderDeliveries = deliveries.filter((d) => d.orderId);
+    required(
+      !orderDeliveries.length || orderDeliveries.length === deliveries.length,
+      'An invoice cannot mix order deliveries and direct-sale deliveries.',
+    );
+    required(
+      i.status !== 'Issued' ||
+        orderDeliveries.length ||
+        (deliveries.length === 1 && deliveries[0].method === 'pickup'),
+      'Direct-sale invoices require exactly one pickup delivery.',
+    );
+    required(
+      orderDeliveries.length || i.status === 'Issued' || !deliveries.length,
+      'Drafts must reference order deliveries.',
+    );
+    if (orderDeliveries.length) {
+      const lines = deliveries.flatMap((d) => d.lines);
+      required(
+        lines.length === i.lines.length &&
+          lines.every((l, index) => {
+            const line = i.lines[index];
+            return (['productId', 'name', 'sku', 'unit', 'factor', 'qty', 'price'] as const).every(
+              (key) => l[key] === line[key],
+            );
+          }),
+        'Invoice lines do not match its delivery notes.',
+      );
+      required(
+        deliveries.every((d) => i.date >= d.date!),
+        'Invoice date cannot be before the latest delivery date.',
       );
     }
+    if (i.status === 'Issued') {
+      const lines = deliveries.flatMap((d) => d.lines);
+      for (const id of new Set([...i.lines, ...lines].map((l) => l.productId)))
+        required(
+          lines.filter((l) => l.productId === id).reduce((n, l) => n + l.qty * l.factor, 0) ===
+            i.lines.filter((l) => l.productId === id).reduce((n, l) => n + l.qty * l.factor, 0),
+          'Invoice deliveries do not match its base quantities.',
+        );
+    }
   });
+
+  const creditNumbers = new Set<string>();
+  s.creditNotes.forEach((cn) => {
+    required(
+      ['Draft', 'Issued'].includes(cn.status) &&
+        Array.isArray(cn.allocations) &&
+        Array.isArray(cn.lines),
+      'Invalid credit note in backup.',
+    );
+    required(
+      typeof cn.number === 'string' &&
+        /^CN-\d{4,}$/.test(cn.number) &&
+        !creditNumbers.has(cn.number) &&
+        Number(cn.number.slice(3)) < s.counters.creditNote,
+      'Invalid credit note number or counter.',
+    );
+    creditNumbers.add(cn.number);
+    required(
+      typeof cn.createdAt === 'string' &&
+        !isNaN(new Date(cn.createdAt).getTime()) &&
+        typeof cn.createdBy === 'string' &&
+        cn.createdBy.trim(),
+      'Invalid credit note audit.',
+    );
+    const prepared = prepareCreditNote(s, cn, cn.id, cn.status === 'Issued');
+    for (const key of [
+      'invoiceId',
+      'customerId',
+      'date',
+      'kind',
+      'reason',
+      'note',
+      'subtotal',
+      'discount',
+      'taxRate',
+      'taxAmount',
+      'total',
+      'returnCost',
+      'settlement',
+      'refundMethod',
+    ] as const)
+      required(cn[key] === prepared[key], 'Credit note amounts or fields do not match.');
+    cn.lines.forEach((l, index) => {
+      const expected = prepared.lines[index];
+      for (const key of [
+        'invoiceLineIndex',
+        'productId',
+        'name',
+        'sku',
+        'unit',
+        'factor',
+        'qty',
+        'price',
+      ] as const)
+        required(l[key] === expected[key], 'Credit note line does not match its invoice.');
+      l.returns.forEach((p, pickIndex) => {
+        const expectedPick = expected.returns[pickIndex];
+        for (const key of ['batchId', 'warehouseId', 'lotCode', 'qty', 'cost'] as const)
+          required(p[key] === expectedPick[key], 'Invalid credit note return pick.');
+        if (cn.status === 'Issued') {
+          const original = s.batches.find((b) => b.id === p.batchId)!;
+          const twin = s.batches.find((b) => b.id === p.returnBatchId);
+          required(
+            twin &&
+              twin.productId === original.productId &&
+              twin.code === original.code &&
+              twin.expiry === original.expiry &&
+              twin.cost === p.cost &&
+              twin.warehouseId === p.warehouseId,
+            'Invalid returned twin batch.',
+          );
+        } else required(p.returnBatchId === undefined, 'Draft credit notes cannot return stock.');
+      });
+    });
+    required(
+      typeof cn.refunded === 'number' &&
+        cn.refunded >= 0 &&
+        round(cn.refunded) === cn.refunded &&
+        Number.isFinite(cn.refunded),
+      'Invalid credit note refund.',
+    );
+    cn.allocations.forEach((a) => {
+      const invoice = s.invoices.find((i) => i.id === a.invoiceId);
+      required(
+        invoice?.status === 'Issued' &&
+          invoice.customerId === cn.customerId &&
+          typeof a.amount === 'number' &&
+          a.amount > 0 &&
+          Number.isFinite(a.amount) &&
+          round(a.amount) === a.amount,
+        'Invalid credit note allocation.',
+      );
+      dateCheck(a.date);
+    });
+    required(creditAvailable(cn) >= 0, 'Invalid credit note settlement.');
+    const moves = s.stockMoves.filter((m) => m.sourceId === cn.id);
+    if (cn.status === 'Issued') {
+      required(
+        typeof cn.issuedAt === 'string' && !isNaN(new Date(cn.issuedAt).getTime()),
+        'Invalid credit note issuedAt.',
+      );
+      const picks = cn.lines.flatMap((l) =>
+        l.returns.map((p) => ({ ...p, productId: l.productId })),
+      );
+      required(
+        moves.length === picks.length &&
+          picks.every((p) => {
+            const index = moves.findIndex(
+              (m) =>
+                m.type === 'return' &&
+                m.batchId === p.returnBatchId &&
+                m.productId === p.productId &&
+                m.qty === p.qty &&
+                m.unitCost === p.cost &&
+                m.reference === cn.number &&
+                m.counterpartyId === cn.customerId &&
+                m.date === cn.date,
+            );
+            if (index < 0) return false;
+            moves.splice(index, 1);
+            return true;
+          }),
+        'Credit note return moves do not match its picks.',
+      );
+    } else
+      required(
+        !cn.allocations.length && cn.refunded === 0 && !cn.issuedAt && !moves.length,
+        'Draft credit notes cannot be posted.',
+      );
+  });
+
+  const validMoney = (n: number) =>
+    typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 100000000 && round(n) === n;
+  const validateAllocations = (allocations: PaymentAllocation[], customerId: string) => {
+    required(Array.isArray(allocations), 'Invalid payment allocations.');
+    allocations.forEach((a) => {
+      const invoice = s.invoices.find((i) => i.id === a.invoiceId);
+      required(
+        invoice?.status === 'Issued' &&
+          invoice.customerId === customerId &&
+          validMoney(a.amount) &&
+          a.amount > 0,
+        'Invalid payment allocation.',
+      );
+      dateCheck(a.date);
+      required(a.date <= today(), 'Allocation date cannot be in the future.');
+    });
+  };
+  const numbers = new Set<string>();
+  s.payments.forEach((p) => {
+    required(
+      contact(s, p.customerId)?.type === 'Customer' &&
+        /^PAY-\d{4,}$/.test(p.number) &&
+        !numbers.has(p.number) &&
+        validMoney(p.amount) &&
+        p.amount > 0 &&
+        paymentMethods.includes(p.method) &&
+        typeof p.reference === 'string' &&
+        typeof p.note === 'string' &&
+        ['Posted', 'Voided'].includes(p.status) &&
+        validMoney(p.refunded) &&
+        typeof p.voidReason === 'string' &&
+        typeof p.voidDate === 'string' &&
+        typeof p.createdBy === 'string' &&
+        !!p.createdBy.trim() &&
+        typeof p.createdAt === 'string' &&
+        !isNaN(new Date(p.createdAt).getTime()) &&
+        (p.legacy === undefined || p.legacy === true),
+      'Invalid customer payment.',
+    );
+    numbers.add(p.number);
+    dateCheck(p.date);
+    required(p.date <= today(), 'Payment date cannot be in the future.');
+    validateAllocations(p.allocations, p.customerId);
+    validateAllocations(p.voidedAllocations, p.customerId);
+    required(
+      sum(p.voidedAllocations, (a) => a.amount) <= p.amount,
+      'Payment allocations and refunds exceed its amount.',
+    );
+    required(
+      sum(p.allocations, (a) => a.amount) + p.refunded <= p.amount,
+      'Payment allocations and refunds exceed its amount.',
+    );
+    if (p.status === 'Voided') {
+      required(
+        !p.allocations.length && p.refunded === 0 && p.voidReason.trim(),
+        'Voided payments cannot have allocations or refunds.',
+      );
+      dateCheck(p.voidDate);
+      required(p.voidDate >= p.date && p.voidDate <= today(), 'Invalid payment void date.');
+    } else
+      required(
+        p.voidReason === '' && p.voidDate === '' && !p.voidedAllocations.length,
+        'Posted payments cannot have void details.',
+      );
+  });
+  required(
+    Number.isSafeInteger(s.counters.payment) &&
+      s.counters.payment >= 1 &&
+      s.payments.every((p) => Number(p.number.slice(4)) < s.counters.payment),
+    'Invalid payment counter.',
+  );
+  s.refunds.forEach((r) => {
+    required(
+      contact(s, r.customerId)?.type === 'Customer' &&
+        validMoney(r.amount) &&
+        r.amount > 0 &&
+        typeof r.method === 'string' &&
+        r.method.trim() &&
+        typeof r.createdBy === 'string' &&
+        r.createdBy.trim() &&
+        Array.isArray(r.from) &&
+        r.from.length,
+      'Invalid refund.',
+    );
+    dateCheck(r.date);
+    required(r.date <= today(), 'Refund date cannot be in the future.');
+    const sources = new Set<string>();
+    r.from.forEach((f) => {
+      required(
+        ['payment', 'credit_note'].includes(f.kind) && !sources.has(f.kind + f.id),
+        'Invalid refund source.',
+      );
+      sources.add(f.kind + f.id);
+      const source =
+        f.kind === 'payment'
+          ? s.payments.find((p) => p.id === f.id && p.status === 'Posted')
+          : s.creditNotes.find((cn) => cn.id === f.id && cn.status === 'Issued');
+      required(
+        source?.customerId === r.customerId && validMoney(f.amount) && f.amount > 0,
+        'Invalid refund source.',
+      );
+    });
+    required(sum(r.from, (f) => f.amount) === r.amount, 'Refund sources do not match its amount.');
+  });
+  for (const [kind, sources] of [
+    ['payment', s.payments],
+    ['credit_note', s.creditNotes],
+  ] as const)
+    sources.forEach((source) =>
+      required(
+        source.refunded ===
+          sum(s.refunds, (r) =>
+            sum(
+              r.from.filter((f) => f.kind === kind && f.id === source.id),
+              (f) => f.amount,
+            ),
+          ),
+        'Source refunds do not match the refunded balance.',
+      ),
+    );
+
   s.purchases.forEach((p) => {
     required(
       contact(s, p.supplierId)?.type === 'Supplier' &&
@@ -3693,7 +6424,14 @@ function validateBackup(value: unknown): Workspace {
     'Backup inventory does not match the ledger.',
   );
   required(
-    b.receivable.balance === sum(s.invoices, invoiceBalance),
+    b.receivable.balance ===
+      round(
+        sum(s.invoices, invoiceBalance) -
+          sum(
+            s.contacts.filter((c) => c.type === 'Customer'),
+            (c) => customerCredit(s, c.id),
+          ),
+      ),
     'Backup customer balances do not match the ledger.',
   );
   required(
@@ -3707,6 +6445,28 @@ function validateBackup(value: unknown): Workspace {
   return s;
 }
 export const A = {
+  contactInUse,
+  agingReport,
+  customerStatement,
+  overdueAmount,
+  paymentCredit,
+  customerCredit,
+  openInvoices,
+  recordPayment,
+  applyCredit,
+  removeAllocation,
+  refundCredit,
+  voidPayment,
+  netSales,
+  creditReasons,
+  creditNoteAmounts,
+  creditNotePicks,
+  creditReturnOptions,
+  proposeCreditReturns,
+  creditAvailable,
+  saveCreditNote,
+  deleteCreditNote,
+  issueCreditNote,
   KEY,
   RECOVERY_KEY,
   round,
@@ -3752,6 +6512,32 @@ export const A = {
   reserveInvoice,
   releaseReservation,
   releaseInvoiceReservations,
+  deliveriesOf,
+  invoiceCost,
+  invoicePicks,
+  createDelivery,
+  deliveryPickable,
+  deliveryQuantities,
+  pendingDeliveryQty,
+  setPicks,
+  cancelDelivery,
+  dispatchDelivery,
+  confirmDelivered,
+  markNotDelivered,
+  returnToStock,
+  deliveredQty,
+  openQty,
+  orderTotals,
+  orderOpenValue,
+  fulfilmentStatus,
+  quoteStatus,
+  saveOrder,
+  confirmOrder,
+  reserveOrder,
+  cancelRemaining,
+  cancelOrder,
+  closeIfDone,
+  orderLineReserved,
   saveReorderRule,
   deleteReorderRule,
   onOrder,
@@ -3791,6 +6577,10 @@ export const A = {
   postCount: (s: Workspace, countId: string) => postCount(s, countId),
   cancelCount,
   createInvoice,
+  createInvoiceFromDeliveries,
+  saveInvoiceHeader,
+  deliveredNotInvoiced,
+  invoicedQty,
   issueInvoice,
   payInvoice,
   deleteDraft,

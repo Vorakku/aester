@@ -117,9 +117,15 @@ export function ReservationsList({
               <StockQuantity product={A.product(state, r.productId)} qty={r.qty} />
             </td>
             <td>
-              {r.source === 'hold'
-                ? 'Hold'
-                : state.invoices.find((i) => i.id === r.sourceId)?.number || 'Deleted draft'}
+              {r.source === 'hold' ? (
+                'Hold'
+              ) : r.source === 'sales_order' ? (
+                <button className="table-link" onClick={() => open('order-detail', r.sourceId)}>
+                  {state.orders.find((o) => o.id === r.sourceId)?.number}
+                </button>
+              ) : (
+                state.invoices.find((i) => i.id === r.sourceId)?.number || 'Deleted draft'
+              )}
             </td>
             <td>{r.expires ? date(r.expires) : '—'}</td>
             <td>

@@ -187,6 +187,7 @@ export function StockQuantity({ product, qty }: { product?: Product; qty: number
 export function Badge({ status }: { status: string }) {
   const tone = [
     'Paid',
+    'Credited',
     'OK',
     'In stock',
     'Active',
@@ -198,6 +199,9 @@ export function Badge({ status }: { status: string }) {
     'Posted',
     'Closed',
     'Fulfilled',
+    'Confirmed',
+    'Done',
+    'Delivered',
   ].includes(status)
     ? ''
     : [
@@ -210,23 +214,42 @@ export function Badge({ status }: { status: string }) {
           'Due',
           'Open',
           'No reg.',
+          'Backorder',
+          'Partly delivered',
         ].includes(status)
       ? 'amber'
       : [
             'Out of stock',
             'Expired',
             'Overdue',
+            'Late',
             'On hold',
             'Over limit',
             'Below cost',
             'Recalled',
+            'Returned',
+            'Voided',
             'Over-reserved',
             'sale',
             'transfer_out',
             'adjustment',
           ].includes(status)
         ? 'red'
-        : ['Quarantined', 'Rx', 'Cold', '❄ Cold', 'Reserved', 'Released'].includes(status)
+        : [
+              'Quarantined',
+              'Rx',
+              'Cold',
+              '❄ Cold',
+              'Reserved',
+              'Released',
+              'return',
+              'Quote',
+              'Picking',
+              'Dispatched',
+              'Monthly',
+              'Per delivery',
+              'Not delivered',
+            ].includes(status)
           ? 'blue'
           : status === 'CD'
             ? 'red'

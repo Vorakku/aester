@@ -1,3 +1,5 @@
+import { PaymentsTable } from '../components/payments';
+import { CreditNotesTable } from '../components/creditNotes';
 import { useState } from 'react';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { A } from '../lib/model';
@@ -28,6 +30,7 @@ import { ControlledRegister } from '../components/ControlledRegister';
 import { RecallsTable } from '../components/recalls';
 import { ReorderSuggestions } from '../components/reorder';
 import { CustomerGroups } from '../components/forms';
+import { ToInvoice } from '../components/invoicing';
 
 export function ExportButton({
   type,
@@ -347,9 +350,11 @@ export function BatchesPage() {
           .toLowerCase()
           .includes(q.toLowerCase()) &&
         (!status ||
-          (status === 'Short-dated'
-            ? A.shortDated(state, b)
-            : A.batchStatus(state, b, state.settings.expiryWindow) === status)) &&
+          (status === 'Quarantined'
+            ? b.quarantined
+            : status === 'Short-dated'
+              ? A.shortDated(state, b)
+              : A.batchStatus(state, b, state.settings.expiryWindow) === status)) &&
         (!warehouse || b.warehouseId === warehouse),
     )
     .sort((a, b) => a.expiry.localeCompare(b.expiry));
@@ -501,6 +506,9 @@ export function BatchesPage() {
                     </td>
                     <td>
                       <Badge status={A.batchStatus(state, b, state.settings.expiryWindow)} />
+                      {state.stockMoves.some((m) => m.batchId === b.id && m.type === 'return') && (
+                        <Badge status="Returned" />
+                      )}
                       {A.shortDated(state, b) && <Badge status="Short-dated" />}
                     </td>
                     <td>
@@ -702,7 +710,15 @@ export function WarehousesPage() {
                 label="Movement type"
                 value={type}
                 onChange={setType}
-                items={['opening', 'receipt', 'sale', 'transfer_out', 'transfer_in', 'adjustment']}
+                items={[
+                  'opening',
+                  'receipt',
+                  'sale',
+                  'return',
+                  'transfer_out',
+                  'transfer_in',
+                  'adjustment',
+                ]}
                 placeholder="All types"
               />
               <Field
@@ -987,7 +1003,7 @@ export function PurchasingPage() {
   );
 }
 export function InvoicesPage() {
-  const { state, period, open } = useWorkspace();
+  const { state, period, open, invoiceTab, setInvoiceTab } = useWorkspace();
   const [q, setQ] = useState(''),
     [status, setStatus] = useState('');
   const items = [...state.invoices]
@@ -1005,7 +1021,14 @@ export function InvoicesPage() {
       <Heading
         title="Invoices"
         subtitle="Simple billing. A complete paper trail."
-        actions={<Button onClick={() => open('invoice-form')}>New invoice</Button>}
+        actions={
+          <>
+            <Button tone="" onClick={() => open('invoice-payment')}>
+              Record payment
+            </Button>
+            <Button onClick={() => open('invoice-form')}>New invoice</Button>
+          </>
+        }
       />
       <div className="metrics">
         <Metric
@@ -1041,32 +1064,77 @@ export function InvoicesPage() {
           foot="Ready for review and issue"
         />
       </div>
-      <section className="panel">
-        <div className="toolbar">
-          <div className="toolbar-left">
-            <SearchInput value={q} onChange={setQ} placeholder="Search invoice or customer..." />
-            <Filter
-              label="Invoice status"
-              value={status}
-              onChange={setStatus}
-              items={['Draft', 'Paid', 'Partial', 'Unpaid', 'Overdue']}
-            />
+      <div className="tab-bar" role="tablist" aria-label="Invoices">
+        <button
+          role="tab"
+          aria-selected={invoiceTab === 'invoices'}
+          className={invoiceTab === 'invoices' ? 'active' : ''}
+          onClick={() => setInvoiceTab('invoices')}
+        >
+          Invoices
+        </button>
+        <button
+          role="tab"
+          aria-selected={invoiceTab === 'to-invoice'}
+          className={invoiceTab === 'to-invoice' ? 'active' : ''}
+          onClick={() => setInvoiceTab('to-invoice')}
+        >
+          To invoice
+        </button>
+        <button
+          role="tab"
+          aria-selected={invoiceTab === 'credit-notes'}
+          className={invoiceTab === 'credit-notes' ? 'active' : ''}
+          onClick={() => setInvoiceTab('credit-notes')}
+        >
+          Credit notes
+        </button>
+        <button
+          role="tab"
+          aria-selected={invoiceTab === 'payments'}
+          className={invoiceTab === 'payments' ? 'active' : ''}
+          onClick={() => setInvoiceTab('payments')}
+        >
+          Payments
+        </button>
+      </div>
+      {invoiceTab === 'payments' ? (
+        <PaymentsTable />
+      ) : invoiceTab === 'credit-notes' ? (
+        <CreditNotesTable />
+      ) : invoiceTab === 'to-invoice' ? (
+        <ToInvoice />
+      ) : (
+        <section className="panel">
+          <div className="toolbar">
+            <div className="toolbar-left">
+              <SearchInput value={q} onChange={setQ} placeholder="Search invoice or customer..." />
+              <Filter
+                label="Invoice status"
+                value={status}
+                onChange={setStatus}
+                items={['Draft', 'Paid', 'Credited', 'Partial', 'Unpaid', 'Overdue']}
+              />
+            </div>
+            <ExportButton type="invoices" />
           </div>
-          <ExportButton type="invoices" />
-        </div>
-        <DataTable
-          items={items}
-          filterKey={`${q}|${status}`}
-          columns={['Invoice', 'Customer', 'Issue date', 'Amount', 'Status', 'Due date', '']}
-          row={(i) => <InvoiceRow key={i.id} invoice={i} />}
-        />
-      </section>
+          <DataTable
+            items={items}
+            filterKey={`${q}|${status}`}
+            columns={['Invoice', 'Customer', 'Issue date', 'Amount', 'Status', 'Due date', '']}
+            row={(i) => <InvoiceRow key={i.id} invoice={i} />}
+          />
+        </section>
+      )}
     </>
   );
 }
 export function ContactsPage() {
   const { state, open } = useWorkspace();
   const [tab, setTab] = useState('contacts');
+  const [showOverdue, setShowOverdue] = useState(false);
+  const [overdueSort, setOverdueSort] = useState<'none' | 'asc' | 'desc'>('none');
+  const overdue = (id: string) => A.overdueAmount(state, id, state.settings.overdueGraceDays);
   const [q, setQ] = useState(''),
     [type, setType] = useState('');
   const items = state.contacts.filter(
@@ -1074,6 +1142,8 @@ export function ContactsPage() {
       `${c.name} ${c.email} ${c.phone}`.toLowerCase().includes(q.toLowerCase()) &&
       (!type || c.type === type),
   );
+  if (showOverdue && overdueSort !== 'none')
+    items.sort((a, b) => (overdue(a.id) - overdue(b.id)) * (overdueSort === 'asc' ? 1 : -1));
   return (
     <>
       <Heading
@@ -1126,12 +1196,38 @@ export function ContactsPage() {
                 placeholder="All contacts"
               />
             </div>
+            <label>
+              <input
+                type="checkbox"
+                checked={showOverdue}
+                onChange={(e) => setShowOverdue(e.target.checked)}
+              />{' '}
+              Show overdue
+            </label>
             <ExportButton type="contacts" />
           </div>
           <DataTable
             items={items}
-            filterKey={`${q}|${type}`}
-            columns={['Contact', 'Type', 'Group', 'Email / phone', 'Location', 'Balance', '']}
+            filterKey={`${q}|${type}|${showOverdue}|${overdueSort}`}
+            columns={[
+              'Contact',
+              'Type',
+              'Group',
+              'Email / phone',
+              'Location',
+              'Balance',
+              ...(showOverdue
+                ? [
+                    <button
+                      aria-label="Sort by overdue amount"
+                      onClick={() => setOverdueSort(overdueSort === 'desc' ? 'asc' : 'desc')}
+                    >
+                      Overdue {overdueSort === 'desc' ? '↓' : overdueSort === 'asc' ? '↑' : '↕'}
+                    </button>,
+                  ]
+                : []),
+              '',
+            ]}
             row={(c) => {
               const balance =
                 c.type === 'Customer'
@@ -1175,6 +1271,9 @@ export function ContactsPage() {
                   <td>
                     <strong>{money(balance)}</strong>
                   </td>
+                  {showOverdue && (
+                    <td className="num">{c.type === 'Customer' ? money(overdue(c.id)) : '?'}</td>
+                  )}
                   <td>
                     <IconButton
                       name="edit"

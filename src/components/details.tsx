@@ -1,3 +1,5 @@
+import { CustomerCreditActions, PaymentsTable, InvoicePayments } from './payments';
+import { CreditNotesTable } from './creditNotes';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { A } from '../lib/model';
 import { date, initials, money, number, errorMessage } from '../lib/format';
@@ -16,6 +18,8 @@ import { InvoiceDocument, InvoiceIssueForm } from './forms';
 import { ReorderLevels } from './reorder';
 import { ReservationsList } from './reservations';
 import { SpecialPrices } from '../pages/Pricing';
+import { CustomerOrders } from './orders';
+import { InvoiceHeaderForm } from './invoicing';
 
 export function ProductDetail({ id }: { id: string }) {
   const { state, open, navigate } = useWorkspace();
@@ -278,6 +282,29 @@ export function InvoiceDetail({ id }: { id: string }) {
   return (
     <>
       <InvoiceDocument invoice={i} />
+      {i.status === 'Issued' && (
+        <>
+          <div className="detail-actions">
+            <Button onClick={() => open('credit-note-form', id)}>Credit note / return</Button>
+          </div>
+          <h3 className="detail-label">Credit notes</h3>
+          <CreditNotesTable invoiceId={id} />
+        </>
+      )}
+      {i.orderId && (
+        <p>
+          Order:{' '}
+          <button className="table-link" onClick={() => open('order-detail', i.orderId)}>
+            {state.orders.find((o) => o.id === i.orderId)?.number}
+          </button>
+        </p>
+      )}
+      {i.status === 'Draft' && i.deliveryIds.length > 0 && (
+        <>
+          <Callout>Lines come from delivery notes and can't be edited.</Callout>
+          <InvoiceHeaderForm id={id} />
+        </>
+      )}
       {i.status === 'Draft' && reserved && <Badge status="Reserved" />}
       <div className="detail-actions">
         <Button tone="" icon="print" onClick={() => window.print()}>
@@ -285,27 +312,31 @@ export function InvoiceDetail({ id }: { id: string }) {
         </Button>
         {i.status === 'Draft' ? (
           <>
-            <Button
-              tone=""
-              onClick={() => {
-                try {
-                  mutate(
-                    (s) =>
-                      reserved ? A.releaseInvoiceReservations(s, id) : A.reserveInvoice(s, id),
-                    reserved ? 'Reservation released.' : 'Stock reserved.',
-                    undefined,
-                    true,
-                  );
-                } catch (error) {
-                  toast(errorMessage(error), true);
-                }
-              }}
-            >
-              {reserved ? 'Release reservation' : 'Reserve stock'}
-            </Button>
-            <Button tone="" icon="edit" onClick={() => open('invoice-form', id)}>
-              Edit draft
-            </Button>
+            {!i.deliveryIds.length && (
+              <Button
+                tone=""
+                onClick={() => {
+                  try {
+                    mutate(
+                      (s) =>
+                        reserved ? A.releaseInvoiceReservations(s, id) : A.reserveInvoice(s, id),
+                      reserved ? 'Reservation released.' : 'Stock reserved.',
+                      undefined,
+                      true,
+                    );
+                  } catch (error) {
+                    toast(errorMessage(error), true);
+                  }
+                }}
+              >
+                {reserved ? 'Release reservation' : 'Reserve stock'}
+              </Button>
+            )}
+            {!i.deliveryIds.length && (
+              <Button tone="" icon="edit" onClick={() => open('invoice-form', id)}>
+                Edit draft
+              </Button>
+            )}
             <InvoiceIssueForm id={id} />
           </>
         ) : A.invoiceBalance(i) > 0 ? (
@@ -313,7 +344,7 @@ export function InvoiceDetail({ id }: { id: string }) {
             Record payment
           </Button>
         ) : (
-          <Badge status="Paid" />
+          <Badge status={A.invoiceStatus(i)} />
         )}
       </div>
       {i.status === 'Draft' && (
@@ -344,36 +375,40 @@ export function InvoiceDetail({ id }: { id: string }) {
           </ul>
         </Callout>
       )}
-      {i.payments.length > 0 && (
+      {i.status === 'Issued' && (
         <>
-          <h3 className="detail-label">Payment history</h3>
-          {i.payments.map((p) => (
-            <div className="detail-batch" key={p.id}>
-              <div>
-                <strong>{p.method}</strong>
-                <small>{date(p.date)}</small>
-              </div>
-              <strong>{money(p.amount)}</strong>
-            </div>
-          ))}
+          <InvoicePayments id={id} />
+          {A.invoiceBalance(i) > 0 && (
+            <CustomerCreditActions customerId={i.customerId} invoiceId={id} />
+          )}
         </>
       )}
-      {i.allocations.length > 0 && (
-        <>
-          <h3 className="detail-label">Allocated batches (FEFO)</h3>
-          {i.allocations.map((a, index) => (
-            <div className="detail-batch" key={index}>
-              <div>
-                <strong>{a.code}</strong>
-                <small>
-                  {A.product(state, a.productId)?.name} · {A.warehouse(state, a.warehouseId)?.name}
-                </small>
-              </div>
-              <strong>{a.qty} units</strong>
+      {A.deliveriesOf(state, i).map((d) => (
+        <section key={d.id}>
+          <h3 className="detail-label">
+            <button className="table-link" onClick={() => open('delivery-detail', d.id)}>
+              {d.number}
+            </button>{' '}
+            · <Badge status={d.status} />
+          </h3>
+          {d.lines.map((l) => (
+            <div key={l.id}>
+              <strong>{l.name}</strong>
+              {l.picks.map((p, index) => (
+                <div className="detail-batch" key={index}>
+                  <div>
+                    <strong>{p.lotCode}</strong>
+                    <small>
+                      {date(p.expiry)} · {A.warehouse(state, p.warehouseId)?.name}
+                    </small>
+                  </div>
+                  <strong>{p.qty} units</strong>
+                </div>
+              ))}
             </div>
           ))}
-        </>
-      )}
+        </section>
+      ))}
     </>
   );
 }
@@ -491,6 +526,17 @@ export function ContactDetail({ id }: { id: string }) {
           ['Address', c.address || '—'],
         ]}
       />
+      {customer && (
+        <>
+          <Button onClick={() => open('invoice-payment', id)}>Record payment</Button>
+          <Button tone="" onClick={() => open('customer-statement', id)}>
+            Statement
+          </Button>
+          <CustomerCreditActions customerId={id} />
+          <h3 className="detail-label">Payments</h3>
+          <PaymentsTable customerId={id} />
+        </>
+      )}
       {customer && <ReservationsList customerId={id} />}
       {customer && <SpecialPrices customerId={id} />}
       {customer && (
@@ -501,6 +547,7 @@ export function ContactDetail({ id }: { id: string }) {
               ['Group', state.customerGroups.find((g) => g.id === c.groupId)?.name || 'No group'],
               ['Payment terms', `${c.paymentTermsDays} days`],
               ['Credit limit', c.creditLimit === null ? 'No limit' : money(c.creditLimit)],
+              ['Available credit', money(A.customerCredit(state, id))],
               ['Current exposure', money(A.creditCheck(state, id, 0).exposure)],
               ['Overdue amount', money(A.creditCheck(state, id, 0).overdue)],
               [
@@ -519,6 +566,13 @@ export function ContactDetail({ id }: { id: string }) {
         </>
       )}
       <h3 className="detail-label">{customer ? 'Invoice' : 'Purchase order'} history</h3>
+      {customer && <CustomerOrders customerId={id} />}
+      {customer && (
+        <>
+          <h3 className="detail-label">Credit notes</h3>
+          <CreditNotesTable customerId={id} />
+        </>
+      )}
       {items.slice(0, 10).map((item) => (
         <button
           className="detail-batch w-full text-left"

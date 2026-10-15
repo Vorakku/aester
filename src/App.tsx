@@ -23,6 +23,8 @@ import {
 } from './pages/Operations';
 import { SettingsPage } from './pages/Settings';
 import { PricingPage } from './pages/Pricing';
+import { DeliveriesPage } from './pages/Deliveries';
+import { OrdersPage } from './pages/Orders';
 import type { Page } from './types';
 import { A } from './lib/model';
 import { download } from './lib/format';
@@ -69,6 +71,8 @@ function WorkspaceApp() {
     warehouses: <WarehousesPage />,
     purchasing: <PurchasingPage />,
     invoices: <InvoicesPage />,
+    orders: <OrdersPage />,
+    deliveries: <DeliveriesPage />,
     pricing: <PricingPage />,
     accounting: <AccountingPage />,
     contacts: <ContactsPage />,
@@ -111,6 +115,8 @@ function WorkspaceApp() {
             {nav('warehouses', 'warehouse')}
             {nav('purchasing', 'cart', A.reorderSuggestions(state).length)}
             <div className="nav-label">SALES</div>
+            {nav('orders', 'invoice')}
+            {nav('deliveries', 'truck')}
             {nav('invoices', 'invoice')}
             {nav('pricing', 'invoice')}
             <div className="nav-label">FINANCE & PEOPLE</div>
@@ -184,7 +190,12 @@ function WorkspaceApp() {
                 aria-label="View stock alerts"
               >
                 <Icon name="bell" />
-                {low.length + expiry.length + recalls.length + holds.length + overReserved.length >
+                {low.length +
+                  expiry.length +
+                  recalls.length +
+                  holds.length +
+                  overReserved.length +
+                  A.deliveredNotInvoiced(state).filter((r) => r.late).length >
                   0 && <i className="notification-dot" />}
               </button>
               <span className="topbar-divider" />

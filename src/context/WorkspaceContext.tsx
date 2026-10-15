@@ -18,6 +18,8 @@ export const pageNames: Record<Page, string> = {
   warehouses: 'Warehouses',
   purchasing: 'Purchasing',
   invoices: 'Invoices',
+  orders: 'Orders',
+  deliveries: 'Deliveries',
   pricing: 'Price lists',
   accounting: 'Accounting',
   analytics: 'Analytics',
@@ -42,7 +44,18 @@ export type DialogKind =
   | 'count-review'
   | 'add-count-lot'
   | 'invoice-form'
+  | 'invoice-header'
+  | 'order-form'
+  | 'new-order'
+  | 'order-detail'
+  | 'delivery-form'
+  | 'delivery-detail'
+  | 'delivery-picks'
   | 'invoice-detail'
+  | 'credit-note-form'
+  | 'credit-note-detail'
+  | 'payment-detail'
+  | 'refund-credit'
   | 'invoice-payment'
   | 'bill-payment'
   | 'purchase-form'
@@ -50,6 +63,7 @@ export type DialogKind =
   | 'purchase-receive'
   | 'expense-form'
   | 'contact-form'
+  | 'customer-statement'
   | 'contact-detail'
   | 'contact-hold'
   | 'help'
@@ -57,7 +71,7 @@ export type DialogKind =
   | 'search'
   | 'activity';
 export type Dialog =
-  | { kind: DialogKind; id?: string; initial?: PurchaseInitial | InvoiceInitial }
+  | { kind: DialogKind; id?: string; initial?: PurchaseInitial | InvoiceInitial; asOf?: string }
   | { kind: 'confirm'; title: string; description: string; label: string; onConfirm: () => void };
 interface Toast {
   id: number;
@@ -69,9 +83,18 @@ interface Context {
   recoveryData: string | null;
   page: Page;
   period: number;
+  accountingTab: string;
+  setAccountingTab: (value: string) => void;
+  invoiceTab: 'invoices' | 'to-invoice' | 'credit-notes' | 'payments';
+  setInvoiceTab: (value: 'invoices' | 'to-invoice' | 'credit-notes' | 'payments') => void;
   setPeriod: (value: number) => void;
   dialog: Dialog | null;
-  open: (kind: DialogKind, id?: string, initial?: PurchaseInitial | InvoiceInitial) => void;
+  open: (
+    kind: DialogKind,
+    id?: string,
+    initial?: PurchaseInitial | InvoiceInitial,
+    asOf?: string,
+  ) => void;
   close: () => void;
   navigate: (page: Page, warehouse?: string, productId?: string) => void;
   ledgerProductFilter: string;
@@ -101,6 +124,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     isPage(location.hash.slice(1)) ? (location.hash.slice(1) as Page) : 'dashboard',
   );
   const [period, setPeriod] = useState(30);
+  const [accountingTab, setAccountingTab] = useState('overview');
+  const [invoiceTab, setInvoiceTab] = useState<
+    'invoices' | 'to-invoice' | 'credit-notes' | 'payments'
+  >('invoices');
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [warehouseFilter, setWarehouseFilter] = useState('');
   const [ledgerProductFilter, setLedgerProductFilter] = useState('');
@@ -131,8 +158,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     document.title = `${pageNames[page]} — Aster Pharmacy`;
   }, [page]);
   const open = useCallback(
-    (kind: DialogKind, id?: string, initial?: PurchaseInitial | InvoiceInitial) =>
-      setDialog({ kind, id, initial }),
+    (kind: DialogKind, id?: string, initial?: PurchaseInitial | InvoiceInitial, asOf?: string) =>
+      setDialog({ kind, id, initial, asOf }),
     [],
   );
   const close = useCallback(() => setDialog(null), []);
@@ -161,6 +188,14 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     keepDialog = false,
   ): T {
     const result = A.transact(stateRef.current, operation);
+    // ponytail: full validation on every save; make it incremental if it gets slow
+    try {
+      A.validateBackup(result.state);
+    } catch (error) {
+      const failure = new Error(`Internal check failed: ${errorMessage(error)}`);
+      toast(failure.message, true);
+      throw failure;
+    }
     replace(result.state, message, keepDialog);
     after?.(result.value);
     return result.value;
@@ -186,6 +221,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         recoveryData,
         page,
         period,
+        accountingTab,
+        setAccountingTab,
+        invoiceTab,
+        setInvoiceTab,
         setPeriod,
         dialog,
         open,

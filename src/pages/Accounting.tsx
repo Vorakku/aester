@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { Receivables } from '../components/receivables';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { A } from '../lib/model';
 import { compactMoney, date, money } from '../lib/format';
@@ -16,8 +16,7 @@ import {
 import { ExportButton } from './Operations';
 
 export function AccountingPage() {
-  const { state, period, open } = useWorkspace();
-  const [tab, setTab] = useState('overview');
+  const { state, period, open, accountingTab: tab, setAccountingTab: setTab } = useWorkspace();
   const b = A.balances(state),
     p = A.balances(state, A.shift(-period + 1));
   const profit = A.round(p.revenue.balance - p.cogs.balance - p.expense.balance - p.loss.balance);
@@ -66,6 +65,7 @@ export function AccountingPage() {
         {[
           ['overview', 'Overview'],
           ['ledger', 'General ledger'],
+          ['receivables', 'Receivables'],
           ['payables', 'Payables'],
           ['expenses', 'Expenses'],
           ['accounts', 'Accounts'],
@@ -79,6 +79,7 @@ export function AccountingPage() {
           </button>
         ))}
       </div>
+      {tab === 'receivables' && <Receivables />}
       {tab === 'overview' && (
         <>
           <div className="two-columns">
@@ -124,6 +125,18 @@ export function AccountingPage() {
                       money(
                         b.revenue.balance - b.cogs.balance - b.expense.balance - b.loss.balance,
                       ),
+                    ],
+                  ]}
+                />
+                <Summary
+                  items={[
+                    [
+                      'Delivered, not invoiced',
+                      money(A.sum(A.deliveredNotInvoiced(state), (r) => r.value)),
+                    ],
+                    [
+                      'Cost already posted without matching revenue',
+                      money(A.sum(A.deliveredNotInvoiced(state), (r) => r.delivery.cost)),
                     ],
                   ]}
                 />

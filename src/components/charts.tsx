@@ -10,12 +10,21 @@ export function usePeriodInvoices() {
     (i) => i.status !== 'Draft' && i.date >= A.shift(-period + 1) && i.date <= A.today(),
   );
 }
+export function usePeriodCredits() {
+  const { state, period } = useWorkspace();
+  return state.creditNotes.filter(
+    (cn) => cn.status === 'Issued' && cn.date >= A.shift(-period + 1) && cn.date <= A.today(),
+  );
+}
 export function RevenuePanel() {
-  const { period } = useWorkspace();
+  const { state, period } = useWorkspace();
   const [mode, setMode] = useState<'month' | 'week'>('month');
   const invoices = usePeriodInvoices();
-  const revenue = A.sum(invoices, (i) => i.subtotal - i.discount);
-  const cogs = A.sum(invoices, (i) => i.cogs || 0);
+  const credits = usePeriodCredits();
+  const revenue = A.netSales(state, A.shift(-period + 1));
+  const cogs = A.round(
+    A.sum(invoices, (i) => A.invoiceCost(state, i)) - A.sum(credits, (cn) => cn.returnCost),
+  );
   const from = A.shift(-period + 1);
   const count =
     mode === 'week'
@@ -29,8 +38,14 @@ export function RevenuePanel() {
     const items = invoices.filter((i) => i.date >= begin && i.date <= last);
     return {
       label: shortDate(begin),
-      sales: A.sum(items, (i) => i.subtotal - i.discount),
-      cost: A.sum(items, (i) => i.cogs || 0),
+      sales: A.netSales(state, begin, last),
+      cost: A.round(
+        A.sum(items, (i) => A.invoiceCost(state, i)) -
+          A.sum(
+            credits.filter((cn) => cn.date >= begin && cn.date <= last),
+            (cn) => cn.returnCost,
+          ),
+      ),
     };
   });
   const w = 650,

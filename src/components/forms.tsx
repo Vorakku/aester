@@ -25,6 +25,7 @@ import type {
   PurchaseInitial,
   Storage,
   Unit,
+  SalesOrder,
 } from '../types';
 
 export function WorkspaceForm({
@@ -627,15 +628,17 @@ export function AdjustmentForm({
 }
 interface EditableLine {
   key: string;
+  id?: string;
   productId: string;
   qty: string;
   price: string;
   unit?: Unit;
   factor: number;
 }
-function newLine(line?: LineInput & { factor?: number }): EditableLine {
+function newLine(line?: LineInput & { factor?: number; id?: string }): EditableLine {
   return {
     key: A.uid('line'),
+    id: line?.id,
     productId: line?.productId || '',
     qty: String(line?.qty || 1),
     price: String(line?.price ?? line?.cost ?? 0),
@@ -646,16 +649,23 @@ function newLine(line?: LineInput & { factor?: number }): EditableLine {
 export function TransactionForm({
   id,
   purchase = false,
+  order = false,
+  asQuote = true,
   initial,
 }: {
   id?: string;
   purchase?: boolean;
+  order?: boolean;
+  asQuote?: boolean;
   initial?: PurchaseInitial | InvoiceInitial;
 }) {
   const { state, mutate, open, close, toast } = useWorkspace();
   const invoice = id ? state.invoices.find((i) => i.id === id) : undefined;
+  const salesOrder = order && id ? state.orders.find((o) => o.id === id) : undefined;
+  const quotation = salesOrder ? salesOrder.status === 'Quote' : asQuote;
   const [lines, setLines] = useState<EditableLine[]>(
     () =>
+      salesOrder?.lines.map(newLine) ||
       invoice?.lines.map(newLine) ||
       initial?.lines.map((line) =>
         newLine({
@@ -673,14 +683,22 @@ export function TransactionForm({
         }),
       ) || [newLine()],
   );
-  const [discount, setDiscount] = useState(String(invoice?.discount || 0)),
-    [taxRate, setTaxRate] = useState(String(invoice?.taxRate ?? state.settings.taxRate));
+  const [discount, setDiscount] = useState(
+      String(salesOrder?.discountPercent ?? invoice?.discount ?? 0),
+    ),
+    [taxRate, setTaxRate] = useState(
+      String(salesOrder?.taxRate ?? invoice?.taxRate ?? state.settings.taxRate),
+    );
   const [scan, setScan] = useState('');
   const [customerId, setCustomerId] = useState(
-    invoice?.customerId || (initial && 'customerId' in initial ? initial.customerId : ''),
+    salesOrder?.customerId ||
+      invoice?.customerId ||
+      (initial && 'customerId' in initial ? initial.customerId : ''),
   );
-  const [allowShortDated, setAllowShortDated] = useState(invoice?.allowShortDated || false);
-  const [invoiceDate, setInvoiceDate] = useState(invoice?.date || A.today());
+  const [allowShortDated, setAllowShortDated] = useState(
+    salesOrder?.allowShortDated || invoice?.allowShortDated || false,
+  );
+  const [invoiceDate, setInvoiceDate] = useState(salesOrder?.date || invoice?.date || A.today());
   const defaultDue = (date: string, customer: string) =>
     A.shift(
       A.contact(state, customer)?.paymentTermsDays ?? state.settings.defaultPaymentTermsDays,
@@ -688,17 +706,36 @@ export function TransactionForm({
     );
   const [due, setDue] = useState(invoice?.due || defaultDue(invoiceDate, customerId));
   const [attemptedIssue, setAttemptedIssue] = useState(false);
-  const saleOptions = { customerId, allowShortDated, exceptSourceId: invoice?.id };
+  const saleOptions = {
+    customerId,
+    allowShortDated,
+    exceptSourceId: salesOrder?.id || invoice?.id,
+  };
   const shortLots = purchase ? [] : A.shortDatedBatches(state, lines, saleOptions);
   const coldOnly = purchase && lines.some((l) => A.product(state, l.productId)?.storage === 'cold');
-  const subtotal = A.sum(lines, (l) => Number(l.qty) * Number(l.price));
-  const discountValue = purchase ? 0 : Number(discount) || 0,
+  const subtotal = A.sum(
+    lines,
+    (l) =>
+      (Number(l.qty) - (salesOrder?.lines.find((old) => old.id === l.id)?.cancelledQty || 0)) *
+      Number(l.price),
+  );
+  const discountValue = purchase
+      ? 0
+      : order
+        ? A.round((subtotal * (Number(discount) || 0)) / 100)
+        : Number(discount) || 0,
     taxValue = purchase ? 0 : Number(taxRate) || 0;
   const tax = A.round((Math.max(0, subtotal - discountValue) * taxValue) / 100);
   const saleTotal = Math.max(0, subtotal - discountValue + tax);
   const credit =
     !purchase && customerId && Number.isFinite(saleTotal) && saleTotal <= 100000000
-      ? A.creditCheck(state, customerId, saleTotal)
+      ? A.creditCheck(
+          state,
+          customerId,
+          salesOrder?.status === 'Confirmed'
+            ? Math.max(0, A.round(saleTotal - A.orderTotals(salesOrder).total))
+            : saleTotal,
+        )
       : undefined;
   function update(key: string, field: 'productId' | 'unit' | 'qty' | 'price', value: string) {
     setLines((current) =>
@@ -765,6 +802,8 @@ export function TransactionForm({
   }
   if (invoice && invoice.status !== 'Draft')
     return <Callout>Only draft invoices can be edited.</Callout>;
+  if (salesOrder && ['Done', 'Cancelled'].includes(salesOrder.status))
+    return <Callout>This order is closed.</Callout>;
   return (
     <WorkspaceForm
       onSubmit={(data, mode) => {
@@ -776,7 +815,37 @@ export function TransactionForm({
           qty: Number(line.qty),
           [purchase ? 'cost' : 'price']: Number(line.price),
         }));
-        if (purchase)
+        if (order) {
+          mutate(
+            (s) => {
+              const saved = A.saveOrder(
+                s,
+                {
+                  customerId,
+                  date: data.date,
+                  validUntil: data.validUntil,
+                  requestedDate: data.requestedDate,
+                  fulfilment: data.fulfilment as 'delivery' | 'pickup',
+                  deliveryAddress: data.deliveryAddress,
+                  lines: lines.map((line, index) => ({ ...items[index], id: line.id })),
+                  discountPercent: discount,
+                  taxRate,
+                  allowShortDated,
+                  notes: data.notes,
+                  override: mode === 'override' ? { reason: data.overrideReason } : undefined,
+                },
+                id,
+              );
+              if (issuing && saved.status === 'Quote')
+                A.confirmOrder(s, saved.id, {
+                  override: mode === 'override' ? { reason: data.overrideReason } : undefined,
+                });
+              return saved;
+            },
+            issuing ? 'Order confirmed.' : 'Order saved.',
+            (saved) => open('order-detail', saved.id),
+          );
+        } else if (purchase)
           mutate(
             (s) =>
               A.createPurchase(s, {
@@ -868,6 +937,7 @@ export function TransactionForm({
             <SelectField
               label="Customer"
               name="customerId"
+              disabled={salesOrder?.status === 'Confirmed'}
               defaultValue={customerId}
               onChange={(value) => {
                 setLines((current) => {
@@ -885,8 +955,9 @@ export function TransactionForm({
             >
               <ContactOptions type="Customer" />
             </SelectField>
+            {order && customerId && <Badge status={A.customerAccountStatus(state, customerId)} />}
             <Field
-              label="Invoice date"
+              label={order ? 'Order date' : 'Invoice date'}
               name="date"
               type="date"
               value={invoiceDate}
@@ -897,18 +968,58 @@ export function TransactionForm({
               max={A.today()}
               required
             />
-            <Field
-              label="Due date"
-              name="due"
-              type="date"
-              value={due}
-              onChange={(event) => setDue(event.target.value)}
-              required
-            />
+            {order ? (
+              <>
+                {quotation && (
+                  <Field
+                    label="Valid until"
+                    name="validUntil"
+                    type="date"
+                    defaultValue={salesOrder?.validUntil || A.shift(14, invoiceDate)}
+                    min={invoiceDate}
+                    required
+                  />
+                )}
+                <Field
+                  label="Requested date"
+                  name="requestedDate"
+                  type="date"
+                  defaultValue={salesOrder?.requestedDate || A.shift(3)}
+                  min={invoiceDate}
+                  required
+                />
+                <SelectField
+                  label="Fulfilment"
+                  name="fulfilment"
+                  defaultValue={salesOrder?.fulfilment || 'delivery'}
+                >
+                  <option value="delivery">Delivery</option>
+                  <option value="pickup">Pickup</option>
+                </SelectField>
+                <Field
+                  key={customerId}
+                  label="Delivery address"
+                  name="deliveryAddress"
+                  defaultValue={
+                    salesOrder?.deliveryAddress ?? A.contact(state, customerId)?.address
+                  }
+                  full
+                />
+              </>
+            ) : (
+              <Field
+                label="Due date"
+                name="due"
+                type="date"
+                value={due}
+                onChange={(event) => setDue(event.target.value)}
+                required
+              />
+            )}
           </>
         )}
       </div>
-      <div className="form-section">{purchase ? 'Order' : 'Invoice'} items</div>
+      <div className="form-section">{purchase || order ? 'Order' : 'Invoice'} items</div>
       {!purchase && (
         <label className="flex items-center gap-[8px] mb-[16px]">
           <input
@@ -1062,12 +1173,13 @@ export function TransactionForm({
       {!purchase && (
         <div className="form-grid mt-[24px]">
           <Field
-            label="Discount ($)"
+            label={order ? 'Discount (%)' : 'Discount ($)'}
             name="discount"
             type="number"
             value={discount}
             onChange={(event) => setDiscount(event.target.value)}
             min="0"
+            max={order ? '100' : undefined}
             step="0.01"
           />
           <Field
@@ -1110,7 +1222,8 @@ export function TransactionForm({
           name="notes"
           id="f-notes"
           defaultValue={
-            invoice?.notes ||
+            salesOrder?.notes ??
+            invoice?.notes ??
             (purchase
               ? ''
               : 'Thank you for your business. Please include the invoice number with your payment.')
@@ -1118,7 +1231,30 @@ export function TransactionForm({
           placeholder={purchase ? 'Delivery instructions, supplier reference...' : undefined}
         />
       </div>
-      {purchase ? (
+      {order ? (
+        <>
+          <Callout>
+            Confirmation checks credit and reserves available stock. Any shortfall stays on
+            backorder.
+          </Callout>
+          <div className="form-footer">
+            <Button icon="close" tone="" onClick={close}>
+              Cancel
+            </Button>
+            {quotation && (
+              <button type="submit" className="btn" value="quote">
+                Save quotation
+              </button>
+            )}
+            <button type="submit" className="btn primary" value="issue">
+              {salesOrder?.status === 'Confirmed' ? 'Save order' : 'Save & confirm order'}
+            </button>
+          </div>
+          {attemptedIssue && credit && !credit.ok && (
+            <CreditOverrideFields reasons={credit.reasons} label="Override and confirm" />
+          )}
+        </>
+      ) : purchase ? (
         <FormFooter label="Create purchase order" />
       ) : (
         <>
@@ -1146,7 +1282,13 @@ export function TransactionForm({
     </WorkspaceForm>
   );
 }
-function CreditOverrideFields({ reasons }: { reasons: string[] }) {
+export function CreditOverrideFields({
+  reasons,
+  label = 'Override and issue',
+}: {
+  reasons: string[];
+  label?: string;
+}) {
   return (
     <>
       <Callout>
@@ -1159,7 +1301,7 @@ function CreditOverrideFields({ reasons }: { reasons: string[] }) {
       <Field label="Override reason" name="overrideReason" minLength={5} />
       <div className="form-footer">
         <button type="submit" className="btn primary" value="override">
-          Override and issue
+          {label}
         </button>
       </div>
     </>
@@ -1169,7 +1311,9 @@ export function InvoiceIssueForm({ id }: { id: string }) {
   const { state, mutate, open } = useWorkspace();
   const [attempted, setAttempted] = useState(false);
   const invoice = state.invoices.find((i) => i.id === id)!;
-  const credit = A.creditCheck(state, invoice.customerId, invoice.total);
+  const credit = invoice.deliveryIds.length
+    ? { ok: true, reasons: [] }
+    : A.creditCheck(state, invoice.customerId, invoice.total);
   return (
     <WorkspaceForm
       onSubmit={(data, mode) => {
@@ -1181,7 +1325,9 @@ export function InvoiceIssueForm({ id }: { id: string }) {
               id,
               mode === 'override' ? { reason: data.overrideReason } : undefined,
             ),
-          'Invoice issued. Stock and accounts updated.',
+          invoice.deliveryIds.length
+            ? 'Invoice issued. Accounts updated.'
+            : 'Invoice issued. Stock and accounts updated.',
           () => open('invoice-detail', id),
         );
       }}
@@ -1306,23 +1452,15 @@ function PriceSource({
             : 'Default';
   return <Badge status={label} />;
 }
-export function PaymentForm({ id, bill = false }: { id: string; bill?: boolean }) {
+export function PaymentForm({ id }: { id: string; bill?: boolean }) {
   const { state, mutate } = useWorkspace();
-  const item = bill
-    ? [...state.purchases, ...state.receipts].find((i) => i.id === id)
-    : state.invoices.find((i) => i.id === id);
+  const item = [...state.purchases, ...state.receipts].find((i) => i.id === id);
   if (!item) return null;
   const amount = A.round(item.total - item.paid);
   return (
     <WorkspaceForm
       onSubmit={(data) =>
-        mutate(
-          (s) =>
-            bill
-              ? A.payBill(s, id, data.amount, data.date)
-              : A.payInvoice(s, id, data.amount, data.method, data.date),
-          bill ? 'Supplier payment recorded.' : 'Payment recorded. Accounts updated.',
-        )
+        mutate((s) => A.payBill(s, id, data.amount, data.date), 'Supplier payment recorded.')
       }
     >
       <Callout>Outstanding {money(amount)}</Callout>
@@ -1345,20 +1483,9 @@ export function PaymentForm({ id, bill = false }: { id: string; bill?: boolean }
           max={A.today()}
           required
         />
-        {!bill && (
-          <SelectField label="Payment method" name="method" full>
-            {['Bank transfer', 'Cash', 'Card', 'Other'].map((method) => (
-              <option key={method}>{method}</option>
-            ))}
-          </SelectField>
-        )}
       </div>
-      <Callout>
-        {bill
-          ? 'This reduces accounts payable and cash & bank.'
-          : 'This reduces accounts receivable and increases cash & bank. Partial payments are supported.'}
-      </Callout>
-      <FormFooter label={bill ? 'Record supplier payment' : 'Record payment'} />
+      <Callout>This reduces accounts payable and cash &amp; bank.</Callout>
+      <FormFooter label="Record supplier payment" />
     </WorkspaceForm>
   );
 }
@@ -1595,8 +1722,11 @@ export function ContactForm({ id }: { id?: string }) {
   );
 }
 
-export function InvoiceDocument({ invoice: i }: { invoice: Invoice }) {
+export function InvoiceDocument({ invoice, order }: { invoice?: Invoice; order?: SalesOrder }) {
   const { state } = useWorkspace();
+  const i = order
+    ? { ...order, ...A.orderTotals(order), due: order.requestedDate, paid: 0, credited: 0 }
+    : invoice!;
   const c = A.contact(state, i.customerId),
     s = state.settings;
   return (
@@ -1612,25 +1742,37 @@ export function InvoiceDocument({ invoice: i }: { invoice: Invoice }) {
           <p>{s.phone}</p>
         </div>
         <div>
-          <h3>INVOICE</h3>
+          <h3>
+            {order ? (order.status === 'Quote' ? 'QUOTATION' : 'ORDER CONFIRMATION') : 'INVOICE'}
+          </h3>
           <p>{i.number}</p>
           <p>{new Date(`${i.date}T12:00:00`).toLocaleDateString('en-GB')}</p>
           <div className="mt-[9px]">
-            <span className="badge">{A.invoiceStatus(i)}</span>
+            <span className="badge">
+              {order
+                ? order.status === 'Quote'
+                  ? A.quoteStatus(order)
+                  : order.status
+                : A.invoiceStatus(invoice!)}
+            </span>
           </div>
         </div>
       </div>
       <div className="invoice-document-parties">
         <div>
-          <span>Bill to</span>
+          <span>{order ? 'Customer' : 'Bill to'}</span>
           <strong>{c?.name}</strong>
           {c?.address}
           <br />
           {c?.email}
         </div>
         <div className="text-right">
-          <span>Payment due</span>
+          <span>{order ? 'Requested date' : 'Payment due'}</span>
           <strong>{new Date(`${i.due}T12:00:00`).toLocaleDateString('en-GB')}</strong>Currency: USD
+          {order && (
+            <p>{order.fulfilment === 'pickup' ? 'Pickup' : `Delivery: ${order.deliveryAddress}`}</p>
+          )}
+          {order?.validUntil && <p>Valid until: {order.validUntil}</p>}
         </div>
       </div>
       <div className="table-wrap">
@@ -1651,10 +1793,11 @@ export function InvoiceDocument({ invoice: i }: { invoice: Invoice }) {
                   <div className="text-[9px] mt-[5px]">{line.sku}</div>
                 </td>
                 <td>
-                  {number(line.qty)} {A.unitLabel(line.unit, line.qty)}
+                  {number(line.qty - (order?.lines[index].cancelledQty || 0))}{' '}
+                  {A.unitLabel(line.unit, line.qty)}
                 </td>
                 <td>{money(line.price)}</td>
-                <td>{money(line.qty * line.price)}</td>
+                <td>{money((line.qty - (order?.lines[index].cancelledQty || 0)) * line.price)}</td>
               </tr>
             ))}
           </tbody>
@@ -1677,14 +1820,25 @@ export function InvoiceDocument({ invoice: i }: { invoice: Invoice }) {
           <span>Total</span>
           <span>{money(i.total)}</span>
         </div>
-        <div>
-          <span>Amount paid</span>
-          <span>{money(i.paid)}</span>
-        </div>
-        <div>
-          <span>{i.status === 'Draft' ? 'On issue' : 'Balance due'}</span>
-          <strong>{money(i.total - i.paid)}</strong>
-        </div>
+        {!order && (
+          <>
+            <div>
+              <span>Amount paid</span>
+              <span>{money(i.paid)}</span>
+            </div>
+            <div>
+              <span>Credited</span>
+              <span>
+                {'\u2212'}
+                {money(i.credited)}
+              </span>
+            </div>
+            <div>
+              <span>{i.status === 'Draft' ? 'On issue' : 'Balance due'}</span>
+              <strong>{money(i.status === 'Draft' ? i.total : A.invoiceBalance(invoice!))}</strong>
+            </div>
+          </>
+        )}
       </div>
       {i.notes && <div className="invoice-note">{i.notes}</div>}
     </div>

@@ -1585,6 +1585,10 @@
     .invoice-document table {
       @apply whitespace-normal;
     }
+    .invoice-document .no-print,
+    .invoice-document .table-footer {
+      display: none;
+    }
     .invoice-document td,
     .invoice-document th {
       @apply [font-size:11px];
@@ -1596,6 +1600,10 @@
   @media print {
     .modal-body > :not(.invoice-document):not(.count-sheet-print) {
       @apply [display:none!important];
+    }
+    .drawer {
+      height: auto;
+      animation: none;
     }
     .count-sheet-print .counted-cell {
       color: transparent !important;

@@ -1,6 +1,63 @@
 import { A } from './model';
 import { csv } from './format';
 import type { Adjustment, Product, StockMove, Unit, Workspace } from '../types';
+export function exportAging(state: Workspace, asOf: string) {
+  csv(
+    `aster-aging-${asOf}.csv`,
+    [
+      'Customer',
+      'Current USD',
+      '1–30 USD',
+      '31–60 USD',
+      '61–90 USD',
+      '90+ USD',
+      'Credit USD',
+      'Total USD',
+    ],
+    A.agingReport(state, asOf).map((r) => [
+      r.customerId ? A.contact(state, r.customerId)?.name : 'Totals',
+      r.current,
+      r.d1_30,
+      r.d31_60,
+      r.d61_90,
+      r.d90plus,
+      r.credit,
+      r.total,
+    ]),
+  );
+}
+export function exportStatement(
+  state: Workspace,
+  customerId: string,
+  range: { from: string; to: string },
+) {
+  const statement = A.customerStatement(state, customerId, range);
+  csv(
+    `aster-statement-${customerId}-${range.from}-${range.to}.csv`,
+    ['Date', 'Type', 'Reference', 'Description', 'Debit USD', 'Credit USD', 'Balance USD'],
+    [
+      [
+        range.from,
+        'Opening balance',
+        '',
+        A.contact(state, customerId)?.name,
+        '',
+        '',
+        statement.opening,
+      ],
+      ...statement.lines.map((l) => [
+        l.date,
+        l.type,
+        l.reference,
+        l.description,
+        l.debit,
+        l.credit,
+        l.balance,
+      ]),
+      [range.to, 'Closing balance', '', '', '', '', statement.closing],
+    ],
+  );
+}
 export function exportPrices(state: Workspace, rows: Array<{ product: Product; unit: Unit }>) {
   csv(
     `aster-prices-${A.today()}.csv`,
@@ -29,13 +86,15 @@ export function exportRecall(state: Workspace, recallId: string) {
   const recall = state.recalls.find((r) => r.id === recallId)!;
   csv(
     `aster-recall-${recall.number}-${A.today()}.csv`,
-    ['Customer', 'Phone', 'Invoice', 'Date', 'Qty'],
+    ['Customer', 'Phone', 'Delivery', 'Invoice', 'Date', 'Qty', 'Returned'],
     A.recallTrace(state, recallId).sold.map((row) => [
       row.customerName,
       row.phone,
+      row.delivery,
       row.invoice,
       row.date,
       row.qty,
+      row.returned,
     ]),
   );
 }
@@ -173,6 +232,7 @@ export function exportData(state: Workspace, type: ExportType, period: number) {
         'Tax USD',
         'Total USD',
         'Paid USD',
+        'Credited USD',
         'Outstanding USD',
         'Status',
       ],
@@ -186,6 +246,7 @@ export function exportData(state: Workspace, type: ExportType, period: number) {
         i.taxAmount,
         i.total,
         i.paid,
+        i.credited,
         A.invoiceBalance(i),
         A.invoiceStatus(i),
       ]),

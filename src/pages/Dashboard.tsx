@@ -1,3 +1,4 @@
+import { AgingBar } from '../components/receivables';
 import { useState } from 'react';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { A } from '../lib/model';
@@ -13,9 +14,15 @@ import {
   ProductArt,
   useStockAlerts,
 } from '../components/ui';
-import { InventoryHealth, RevenuePanel, usePeriodInvoices } from '../components/charts';
+import {
+  InventoryHealth,
+  RevenuePanel,
+  usePeriodInvoices,
+  usePeriodCredits,
+} from '../components/charts';
 import { ExportButton, InvoiceRow, movementIcons } from './Operations';
 import { ReservationAlerts } from '../components/reservations';
+import { BillingAttention } from '../components/invoicing';
 
 function AttentionPanel() {
   const { state, open, navigate } = useWorkspace();
@@ -39,6 +46,7 @@ function AttentionPanel() {
           </button>
         }
       />
+      <BillingAttention />
       <div className="attention-tabs flex-wrap">
         <button className={tab === 'low' ? 'active' : ''} onClick={() => setTab('low')}>
           Low stock <span className="count-chip">{low.length}</span>
@@ -136,15 +144,8 @@ function AttentionPanel() {
 export function DashboardPage() {
   const { state, period, open, navigate } = useWorkspace();
   const { low, expiry } = useStockAlerts();
-  const issued = usePeriodInvoices();
-  const revenue = A.sum(issued, (i) => i.subtotal - i.discount);
-  const previous = A.sum(
-    state.invoices.filter(
-      (i) =>
-        i.status !== 'Draft' && i.date >= A.shift(-period * 2 + 1) && i.date < A.shift(-period + 1),
-    ),
-    (i) => i.subtotal - i.discount,
-  );
+  const revenue = A.netSales(state, A.shift(-period + 1));
+  const previous = A.netSales(state, A.shift(-period * 2 + 1), A.shift(-period));
   const growth = previous ? A.round(((revenue - previous) / previous) * 100) : 0;
   return (
     <>
@@ -206,6 +207,7 @@ export function DashboardPage() {
           tone="amber"
         />
       </div>
+      <AgingBar />
       <div className="dashboard-top">
         <RevenuePanel />
         <InventoryHealth />
@@ -289,11 +291,20 @@ export function DashboardPage() {
   );
 }
 export function AnalyticsPage() {
-  const { state, open } = useWorkspace();
+  const { state, open, period } = useWorkspace();
   const invoices = usePeriodInvoices();
-  const revenue = A.sum(invoices, (i) => i.subtotal - i.discount),
-    cost = A.sum(invoices, (i) => i.cogs || 0),
-    units = A.sum(invoices, (i) => A.sum(i.lines, (l) => l.qty));
+  const credits = usePeriodCredits();
+  const revenue = A.netSales(state, A.shift(-period + 1)),
+    cost = A.round(
+      A.sum(invoices, (i) => A.invoiceCost(state, i)) - A.sum(credits, (cn) => cn.returnCost),
+    ),
+    units = A.round(
+      A.sum(invoices, (i) => A.sum(i.lines, (l) => l.qty)) -
+        A.sum(
+          credits.filter((cn) => cn.kind === 'return'),
+          (cn) => A.sum(cn.lines, (l) => l.qty),
+        ),
+    );
   const ranking: Record<string, { qty: number; revenue: number }> = {};
   invoices.forEach((i) =>
     i.lines.forEach((l) => {
@@ -301,6 +312,14 @@ export function AnalyticsPage() {
       ranking[l.productId] ||= { qty: 0, revenue: 0 };
       ranking[l.productId].qty += l.qty;
       ranking[l.productId].revenue += l.qty * l.price * factor;
+    }),
+  );
+  credits.forEach((cn) =>
+    cn.lines.forEach((l) => {
+      ranking[l.productId] ||= { qty: 0, revenue: 0 };
+      if (cn.kind === 'return') ranking[l.productId].qty -= l.qty;
+      ranking[l.productId].revenue -=
+        (l.qty * l.price * (cn.subtotal - cn.discount)) / (cn.subtotal || 1);
     }),
   );
   const best = Object.entries(ranking)
@@ -321,7 +340,17 @@ export function AnalyticsPage() {
     .filter((c) => c.type === 'Customer')
     .map((c) => {
       const items = invoices.filter((i) => i.customerId === c.id);
-      return { c, count: items.length, revenue: A.sum(items, (i) => i.subtotal - i.discount) };
+      return {
+        c,
+        count: items.length,
+        revenue: A.round(
+          A.sum(items, (i) => i.subtotal - i.discount) -
+            A.sum(
+              credits.filter((cn) => cn.customerId === c.id),
+              (cn) => cn.subtotal - cn.discount,
+            ),
+        ),
+      };
     })
     .sort((a, b) => b.revenue - a.revenue);
   return (
