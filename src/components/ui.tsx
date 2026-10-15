@@ -218,6 +218,7 @@ export function Badge({ status }: { status: string }) {
             'Overdue',
             'On hold',
             'Over limit',
+            'Below cost',
             'Recalled',
             'Over-reserved',
             'sale',
@@ -423,7 +424,7 @@ export function DataTable<T>({
   pageSize = 8,
 }: {
   items: T[];
-  columns: string[];
+  columns: ReactNode[];
   row: (item: T, index: number) => ReactNode;
   filterKey?: string;
   pageSize?: number;

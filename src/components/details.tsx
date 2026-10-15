@@ -15,6 +15,7 @@ import {
 import { InvoiceDocument, InvoiceIssueForm } from './forms';
 import { ReorderLevels } from './reorder';
 import { ReservationsList } from './reservations';
+import { SpecialPrices } from '../pages/Pricing';
 
 export function ProductDetail({ id }: { id: string }) {
   const { state, open, navigate } = useWorkspace();
@@ -491,6 +492,7 @@ export function ContactDetail({ id }: { id: string }) {
         ]}
       />
       {customer && <ReservationsList customerId={id} />}
+      {customer && <SpecialPrices customerId={id} />}
       {customer && (
         <>
           <h3 className="detail-label">Account</h3>

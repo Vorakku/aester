@@ -5,6 +5,7 @@ export type Page =
   | 'warehouses'
   | 'purchasing'
   | 'invoices'
+  | 'pricing'
   | 'accounting'
   | 'analytics'
   | 'contacts'
@@ -173,6 +174,15 @@ export interface CustomerGroup {
   id: string;
   name: string;
   discountPercent: number;
+}
+export interface PriceEntry {
+  id: string;
+  productId: string;
+  unit: Unit;
+  price: number;
+  groupId?: string;
+  customerId?: string;
+  note: string;
 }
 export interface Recall {
   id: string;
@@ -357,6 +367,7 @@ export interface Workspace {
   batches: Batch[];
   contacts: Contact[];
   customerGroups: CustomerGroup[];
+  prices: PriceEntry[];
   warehouses: Warehouse[];
   invoices: Invoice[];
   purchases: Purchase[];

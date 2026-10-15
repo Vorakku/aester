@@ -1,6 +1,30 @@
 import { A } from './model';
 import { csv } from './format';
-import type { Adjustment, StockMove, Workspace } from '../types';
+import type { Adjustment, Product, StockMove, Unit, Workspace } from '../types';
+export function exportPrices(state: Workspace, rows: Array<{ product: Product; unit: Unit }>) {
+  csv(
+    `aster-prices-${A.today()}.csv`,
+    [
+      'Product',
+      'SKU',
+      'Unit',
+      'Cost',
+      'Default price',
+      ...state.customerGroups.map((g) => `${g.name} (${g.discountPercent}% off default)`),
+    ],
+    rows.map(({ product: p, unit }) => [
+      p.name,
+      p.sku,
+      unit,
+      A.unitPrice(p, unit, true),
+      A.unitPrice(p, unit),
+      ...state.customerGroups.map((g) => {
+        const resolved = A.groupPriceFor(state, { productId: p.id, unit, groupId: g.id });
+        return resolved.source === 'default' ? '' : resolved.price;
+      }),
+    ]),
+  );
+}
 export function exportRecall(state: Workspace, recallId: string) {
   const recall = state.recalls.find((r) => r.id === recallId)!;
   csv(

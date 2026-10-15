@@ -4,6 +4,7 @@ import { A } from '../lib/model';
 import { errorMessage, money, number } from '../lib/format';
 import {
   Button,
+  Badge,
   Callout,
   ContactOptions,
   Field,
@@ -660,6 +661,15 @@ export function TransactionForm({
         newLine({
           ...line,
           factor: A.unitFactor(A.product(state, line.productId)!, line.unit),
+          ...(!purchase
+            ? {
+                price: A.priceFor(state, {
+                  productId: line.productId,
+                  unit: line.unit || A.product(state, line.productId)!.unit,
+                  customerId: initial && 'customerId' in initial ? initial.customerId : undefined,
+                }).price,
+              }
+            : {}),
         }),
       ) || [newLine()],
   );
@@ -702,7 +712,13 @@ export function TransactionForm({
             ...(field === 'productId' ? { productId: value } : {}),
             unit,
             factor: p ? A.unitFactor(p, unit) : 1,
-            price: String(p ? A.unitPrice(p, unit, purchase) : 0),
+            price: String(
+              p
+                ? purchase
+                  ? A.unitPrice(p, unit, true)
+                  : A.priceFor(state, { productId: p.id, unit: unit || p.unit, customerId }).price
+                : 0,
+            ),
           };
         }
         return { ...line, [field]: value };
@@ -736,7 +752,9 @@ export function TransactionForm({
         unit,
         factor: A.unitFactor(p, unit),
         qty: 1,
-        price: A.unitPrice(p, unit, purchase),
+        price: purchase
+          ? A.unitPrice(p, unit, true)
+          : A.priceFor(state, { productId: p.id, unit, customerId }).price,
       });
       const blank = current.find((line) => !line.productId);
       return blank
@@ -852,6 +870,13 @@ export function TransactionForm({
               name="customerId"
               defaultValue={customerId}
               onChange={(value) => {
+                setLines((current) => {
+                  const repriced = A.repriceLines(state, current, customerId, value);
+                  return current.map((line, index) => ({
+                    ...line,
+                    price: String(repriced[index].price),
+                  }));
+                });
                 setCustomerId(value);
                 setDue(defaultDue(invoiceDate, value));
                 setAttemptedIssue(false);
@@ -927,6 +952,7 @@ export function TransactionForm({
             const p = A.product(state, line.productId),
               unit = line.unit || p?.unit;
             const choices = p ? [p.unit, ...p.packs.map((pack) => pack.unit)] : [];
+            const validUnit = unit && choices.includes(unit);
             if (unit && !choices.includes(unit)) choices.push(unit);
             return (
               <div className="line-item" key={line.key}>
@@ -983,15 +1009,31 @@ export function TransactionForm({
                     </small>
                   )}
                 </div>
-                <input
-                  type="number"
-                  required
-                  min="0"
-                  step="0.01"
-                  aria-label={`Line unit ${purchase ? 'cost' : 'price'}`}
-                  value={line.price}
-                  onChange={(event) => update(line.key, 'price', event.target.value)}
-                />
+                <div>
+                  <input
+                    type="number"
+                    required
+                    min="0"
+                    step="0.01"
+                    aria-label={`Line unit ${purchase ? 'cost' : 'price'}`}
+                    value={line.price}
+                    onChange={(event) => update(line.key, 'price', event.target.value)}
+                  />
+                  {p && unit && validUnit && !purchase && (
+                    <>
+                      <PriceSource
+                        productId={p.id}
+                        unit={unit}
+                        customerId={customerId}
+                        price={Number(line.price)}
+                      />
+                      {A.belowCost(state, p.id, unit, Number(line.price)) && (
+                        <Badge status="Below cost" />
+                      )}
+                    </>
+                  )}
+                  {p && !validUnit && !purchase && <Badge status="Manual" />}
+                </div>
                 <span className="line-total">{money(Number(line.qty) * Number(line.price))}</span>
                 <IconButton
                   name="trash"
@@ -1179,7 +1221,7 @@ export function ContactHoldForm({ id }: { id: string }) {
   );
 }
 export function CustomerGroups() {
-  const { state, mutate } = useWorkspace();
+  const { state, mutate, confirm } = useWorkspace();
   return (
     <div className="panel-body">
       <h3 className="detail-label">Customer groups</h3>
@@ -1188,12 +1230,19 @@ export function CustomerGroups() {
           key={g.id}
           className="mb-[20px]"
           onSubmit={(data, mode) => {
+            if (mode === 'delete') {
+              const count = state.prices.filter((e) => e.groupId === g.id).length;
+              confirm(
+                'Delete customer group?',
+                `${g.name}: ${count} price entries will also be deleted.`,
+                () => mutate((s) => A.deleteCustomerGroup(s, g.id), 'Customer group deleted.'),
+                'Delete',
+              );
+              return;
+            }
             mutate(
-              (s) =>
-                mode === 'delete'
-                  ? A.deleteCustomerGroup(s, g.id)
-                  : A.saveCustomerGroup(s, { name: data[`group-${g.id}`] }, g.id),
-              mode === 'delete' ? 'Customer group deleted.' : 'Customer group saved.',
+              (s) => A.saveCustomerGroup(s, { name: data[`group-${g.id}`] }, g.id),
+              'Customer group saved.',
               undefined,
               true,
             );
@@ -1230,6 +1279,32 @@ export function CustomerGroups() {
       </WorkspaceForm>
     </div>
   );
+}
+function PriceSource({
+  productId,
+  unit,
+  customerId,
+  price,
+}: {
+  productId: string;
+  unit: Unit;
+  customerId: string;
+  price: number;
+}) {
+  const { state } = useWorkspace();
+  const resolved = A.priceFor(state, { productId, unit, customerId });
+  const group = state.customerGroups.find((g) => g.id === A.contact(state, customerId)?.groupId);
+  const label =
+    price !== resolved.price
+      ? 'Manual'
+      : resolved.source === 'customer'
+        ? 'Special'
+        : resolved.source === 'group'
+          ? `${group?.name} price`
+          : resolved.source === 'group_discount'
+            ? `${group?.name} −${group?.discountPercent}%`
+            : 'Default';
+  return <Badge status={label} />;
 }
 export function PaymentForm({ id, bill = false }: { id: string; bill?: boolean }) {
   const { state, mutate } = useWorkspace();

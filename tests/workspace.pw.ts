@@ -6,6 +6,54 @@ async function saved(page: Page) {
   );
 }
 
+test('Clinic price lists fill invoice lines and customer changes reprice defaults while preserving manual prices', async ({
+  page,
+}) => {
+  await page.goto('/#pricing');
+  await expect(page.getByRole('heading', { name: 'Price lists', exact: true })).toBeVisible();
+  await page.getByRole('textbox', { name: 'Search prices, product or SKU...' }).fill('AST-0001');
+  const cell = page.getByRole('spinbutton', {
+    name: 'Clinic price for Paracetamol 500mg (box)',
+    exact: true,
+  });
+  await cell.fill('4.75');
+  await cell.press('Tab');
+  await expect(page.getByRole('status')).toContainText('Price saved.');
+  const before = await saved(page);
+  const clinic = before.customerGroups.find((g: { name: string }) => g.name === 'Clinic');
+  const customer = before.contacts.find(
+    (c: { type: string; groupId: string; onHold: boolean }) =>
+      c.type === 'Customer' && c.groupId === clinic.id && !c.onHold,
+  );
+  expect(
+    before.prices.find(
+      (e: { productId: string; unit: string; groupId: string }) =>
+        e.productId === 'p1' && e.unit === 'box' && e.groupId === clinic.id,
+    ).price,
+  ).toBe(4.75);
+  await page.getByRole('button', { name: 'Invoices', exact: true }).click();
+  await page.getByRole('button', { name: 'New invoice', exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Customer', { exact: false }).selectOption(customer.id);
+  await dialog.getByLabel('Line product', { exact: true }).selectOption('p1');
+  await expect(dialog.getByLabel('Line unit price', { exact: true })).toHaveValue('4.75');
+  await expect(dialog.getByText('Clinic price', { exact: true })).toBeVisible();
+  // c4 is a Pharmacy customer without a special price for this product.
+  await dialog.getByLabel('Customer', { exact: false }).selectOption('c4');
+  await expect(dialog.getByLabel('Line unit price', { exact: true })).toHaveValue('5.8');
+  await expect(dialog.getByText('Default', { exact: true })).toBeVisible();
+  await dialog.getByLabel('Line unit price', { exact: true }).fill('5.25');
+  await dialog.getByLabel('Customer', { exact: false }).selectOption(customer.id);
+  await expect(dialog.getByLabel('Line unit price', { exact: true })).toHaveValue('5.25');
+  await expect(dialog.getByText('Manual', { exact: true })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Save draft', exact: true }).click();
+  expect((await saved(page)).invoices[0]).toMatchObject({
+    customerId: customer.id,
+    status: 'Draft',
+    lines: [{ productId: 'p1', unit: 'box', price: 5.25 }],
+  });
+});
+
 test('a customer hold blocks invoice issue with its reason and records an override before issuing', async ({
   page,
 }) => {
@@ -785,7 +833,7 @@ test('stock ledger connects receipts, lot history, past stock, and filtered CSV'
   await expect(history.locator('td').nth(4)).toHaveText('25');
   await expect(history).toContainText('Krisstoff');
 });
-test('all ten screens render without console or React errors', async ({ page }) => {
+test('all screens render without console or React errors', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
   page.on('console', (message) => {
@@ -799,6 +847,7 @@ test('all ten screens render without console or React errors', async ({ page }) 
     ['warehouses', 'Warehouses'],
     ['purchasing', 'Purchasing'],
     ['invoices', 'Invoices'],
+    ['pricing', 'Price lists'],
     ['accounting', 'Accounting'],
     ['analytics', 'Business analytics'],
     ['contacts', 'Contacts'],

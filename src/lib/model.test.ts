@@ -79,6 +79,316 @@ function stocked() {
   });
   return { s, supplier, customer, p, late, early };
 }
+describe('price lists', () => {
+  function pricing() {
+    const setup = stocked();
+    const { s, p, customer } = setup;
+    const group = A.saveCustomerGroup(s, { name: 'Hospital', discountPercent: 8 });
+    A.saveContact(s, { ...customer, groupId: group.id }, customer.id);
+    A.saveProduct(
+      s,
+      { ...p, price: 10, packs: [{ unit: 'carton', factor: 50, barcode: '', price: 450 }] },
+      p.id,
+    );
+    return { ...setup, p: A.product(s, p.id)!, group };
+  }
+  it('resolves customer > group entry > group discount > default, removing each higher priority', () => {
+    const { s, p, customer, group } = pricing();
+    const input = { productId: p.id, unit: p.unit, customerId: customer.id };
+    const groupEntry = A.savePrice(s, {
+      productId: p.id,
+      unit: p.unit,
+      groupId: group.id,
+      price: 8,
+    });
+    const special = A.savePrice(s, { ...input, price: 7, note: ' Contract ' });
+    expect(special.id.startsWith('price_')).toBe(true);
+    expect(special.note).toBe('Contract');
+    expect(A.priceFor(s, input)).toEqual({ price: 7, source: 'customer', entryId: special.id });
+    A.deletePrice(s, special.id);
+    expect(A.priceFor(s, input)).toEqual({ price: 8, source: 'group', entryId: groupEntry.id });
+    A.deletePrice(s, groupEntry.id);
+    expect(A.priceFor(s, input)).toEqual({ price: 9.2, source: 'group_discount' });
+    A.saveCustomerGroup(s, { ...group, discountPercent: 0 }, group.id);
+    expect(A.priceFor(s, input)).toEqual({ price: 10, source: 'default' });
+    expect(A.priceFor(s, { ...input, customerId: undefined })).toEqual({
+      price: 10,
+      source: 'default',
+    });
+    assertInvariants(s);
+  });
+  it.each(['group', 'customer'] as const)(
+    'keeps carton and box %s entries independent in both directions',
+    (target) => {
+      const { s, p, customer, group } = pricing();
+      const input = { productId: p.id, customerId: customer.id };
+      const owner = target === 'group' ? { groupId: group.id } : { customerId: customer.id };
+      const carton = A.savePrice(s, { productId: p.id, unit: 'carton', price: 400, ...owner });
+      expect(A.priceFor(s, { ...input, unit: 'carton' }).price).toBe(400);
+      expect(A.priceFor(s, { ...input, unit: 'box' })).toEqual({
+        price: 9.2,
+        source: 'group_discount',
+      });
+      const box = A.savePrice(s, { productId: p.id, unit: 'box', price: 8, ...owner });
+      expect(A.priceFor(s, { ...input, unit: 'box' }).price).toBe(8);
+      expect(A.priceFor(s, { ...input, unit: 'carton' }).price).toBe(400);
+      A.deletePrice(s, carton.id);
+      expect(A.priceFor(s, { ...input, unit: 'carton' }).price).toBe(414);
+      expect(A.priceFor(s, { ...input, unit: 'box' }).price).toBe(8);
+      A.deletePrice(s, box.id);
+      assertInvariants(s);
+    },
+  );
+  it('discounts a $10 default by 8% to $9.20 and rounds fractional cents', () => {
+    const { s, p, customer } = pricing();
+    const input = { productId: p.id, unit: p.unit, customerId: customer.id };
+    expect(A.priceFor(s, input).price).toBe(9.2);
+    A.saveProduct(s, { ...p, price: 10.01 }, p.id);
+    expect(A.priceFor(s, input).price).toBe(9.21);
+    A.saveProduct(
+      s,
+      { ...A.product(s, p.id)!, packs: [{ unit: 'carton', factor: 50, barcode: '' }] },
+      p.id,
+    );
+    expect(A.priceFor(s, { ...input, unit: 'carton' }).price).toBe(460.46);
+    assertInvariants(s);
+  });
+  it('rejects duplicate keys on create and edit, permits updating an entry and separate targets', () => {
+    const { s, p, customer, group } = pricing();
+    const input = { productId: p.id, unit: p.unit, groupId: group.id, price: 8 };
+    const entry = A.savePrice(s, input);
+    expect(() => A.savePrice(s, input)).toThrow(
+      'A price already exists for this product, unit and target.',
+    );
+    expect(A.savePrice(s, { ...input, price: '8.126' }, entry.id).price).toBe(8.13);
+    const special = A.savePrice(s, {
+      productId: p.id,
+      unit: p.unit,
+      customerId: customer.id,
+      price: 7,
+    });
+    expect(() => A.savePrice(s, input, special.id)).toThrow(
+      'A price already exists for this product, unit and target.',
+    );
+    expect(() => A.savePrice(s, input, 'missing')).toThrow('Price not found.');
+    expect(() => A.deletePrice(s, 'missing')).toThrow('Price not found.');
+    assertInvariants(s);
+  });
+  it('validates exactly one existing target, rejecting suppliers, inactive products, invalid units and nonpositive prices atomically', () => {
+    const { s, p, customer, supplier, group } = pricing();
+    const input = { productId: p.id, unit: p.unit, groupId: group.id, price: 8 };
+    const cases = [
+      { groupId: undefined },
+      { customerId: customer.id },
+      { groupId: 'missing' },
+      { groupId: undefined, customerId: 'missing' },
+      { groupId: undefined, customerId: supplier.id },
+      { productId: 'missing' },
+      { unit: 'tube' as const },
+      { price: 0 },
+      { price: -1 },
+      { price: NaN },
+      { price: Infinity },
+      { price: 100000001 },
+      { price: 0.001 },
+    ];
+    const before = structuredClone(s);
+    cases.forEach((change) => {
+      expect(() => A.transact(s, (copy) => A.savePrice(copy, { ...input, ...change }))).toThrow();
+      expect(s).toEqual(before);
+    });
+    const inactive = A.saveProduct(s, {
+      ...p,
+      sku: 'INACTIVE',
+      active: false,
+      barcode: '',
+      packs: [],
+    });
+    expect(() => A.savePrice(s, { ...input, productId: inactive.id })).toThrow(
+      `${inactive.name} is inactive.`,
+    );
+    assertInvariants(s);
+  });
+  it('deleting an unused group removes only its entries and preserves customer specials', () => {
+    const { s, p, customer, group } = pricing();
+    const other = A.saveCustomerGroup(s, { name: 'Clinic' });
+    A.savePrice(s, { productId: p.id, unit: p.unit, groupId: group.id, price: 8 });
+    A.savePrice(s, { productId: p.id, unit: 'carton', groupId: group.id, price: 400 });
+    const retained = A.savePrice(s, { productId: p.id, unit: p.unit, groupId: other.id, price: 9 });
+    const special = A.savePrice(s, {
+      productId: p.id,
+      unit: p.unit,
+      customerId: customer.id,
+      price: 7,
+    });
+    expect(() => A.deleteCustomerGroup(s, group.id)).toThrow('Hospital is used by 1 customers.');
+    A.saveContact(s, { ...customer, groupId: '' }, customer.id);
+    A.deleteCustomerGroup(s, group.id);
+    expect(s.prices).toEqual([retained, special]);
+    assertInvariants(s);
+  });
+  it('flags prices strictly below rounded base and carton costs, permitting equality', () => {
+    const { s, p } = pricing();
+    for (const unit of [p.unit, 'carton'] as const) {
+      const cost = A.round(p.cost * A.unitFactor(p, unit));
+      expect(A.belowCost(s, p.id, unit, cost - 0.01)).toBe(true);
+      expect(A.belowCost(s, p.id, unit, cost)).toBe(false);
+      expect(A.belowCost(s, p.id, unit, cost + 0.01)).toBe(false);
+    }
+    assertInvariants(s);
+  });
+  it('uses resolved defaults for new invoices, preserves explicit prices and does not reprice stored documents', () => {
+    const { s, p, customer } = pricing();
+    const input = {
+      customerId: customer.id,
+      date: A.today(),
+      lines: [{ productId: p.id, qty: 1 }],
+    };
+    const old = A.createInvoice(s, input);
+    expect(old.lines[0].price).toBe(9.2);
+    A.savePrice(s, { productId: p.id, unit: p.unit, customerId: customer.id, price: 7 });
+    expect(A.createInvoice(s, input).lines[0].price).toBe(7);
+    expect(
+      A.createInvoice(s, { ...input, lines: [{ ...input.lines[0], price: 6 }] }).lines[0].price,
+    ).toBe(6);
+    expect(old.lines[0].price).toBe(9.2);
+    assertInvariants(s);
+  });
+  it('retains inactive product prices in backups, allows deletion and prevents removing a priced unit or changing a special customer to supplier', () => {
+    const s = empty();
+    const p = A.saveProduct(s, {
+      ...A.seed().products[0],
+      sku: 'PRICED',
+      barcode: '',
+      packs: [{ unit: 'carton', factor: 50, barcode: '' }],
+    });
+    const customer = A.saveContact(s, {
+      type: 'Customer',
+      name: 'Special buyer',
+      person: '',
+      email: '',
+      phone: '',
+      address: '',
+    });
+    const entry = A.savePrice(s, {
+      productId: p.id,
+      unit: 'carton',
+      customerId: customer.id,
+      price: 240,
+    });
+    expect(() => A.saveProduct(s, { ...p, packs: [] }, p.id)).toThrow(
+      'Delete price entries for this unit before removing it.',
+    );
+    expect(() => A.saveContact(s, { ...customer, type: 'Supplier' }, customer.id)).toThrow();
+    A.saveProduct(s, { ...p, active: false }, p.id);
+    expect(s.prices).toEqual([entry]);
+    expect(() => A.savePrice(s, { ...entry, price: 250 }, entry.id)).toThrow(
+      `${p.name} is inactive.`,
+    );
+    assertInvariants(s);
+    A.deletePrice(s, entry.id);
+    assertInvariants(s);
+  });
+  it('reprices untouched draft lines on customer changes, retaining manual prices and obsolete unit snapshots', () => {
+    const { s, p, customer } = pricing();
+    const specialCustomer = A.saveContact(s, { ...customer, name: 'Special buyer', groupId: '' });
+    A.savePrice(s, { productId: p.id, unit: p.unit, customerId: specialCustomer.id, price: 7 });
+    const lines = [
+      { productId: p.id, unit: p.unit, qty: 1, price: '9.20' },
+      { productId: p.id, unit: p.unit, qty: 1, price: '8.50' },
+      { productId: p.id, unit: 'carton' as const, qty: 1, price: 414 },
+      { productId: p.id, unit: 'case' as const, qty: 1, price: 123 },
+      { productId: '', qty: 1, price: 0 },
+    ];
+    const before = structuredClone(lines);
+    const repriced = A.repriceLines(s, lines, customer.id, specialCustomer.id);
+    expect(repriced.map((l) => l.price)).toEqual([7, '8.50', 450, 123, 0]);
+    expect(lines).toEqual(before);
+    expect(
+      A.repriceLines(s, repriced, specialCustomer.id, customer.id).map((l) => l.price),
+    ).toEqual([9.2, '8.50', 414, 123, 0]);
+    assertInvariants(s);
+  });
+  it.each([1, 2])(
+    'migrates v%i prices and missing discount defaults idempotently, preserving stored line prices',
+    (version) => {
+      const raw = JSON.parse(JSON.stringify(A.seed()));
+      raw.version = version;
+      delete raw.prices;
+      raw.customerGroups.forEach((g: { discountPercent?: number }) => delete g.discountPercent);
+      const lines = structuredClone(raw.invoices);
+      const s = A.validateBackup(raw);
+      expect(s.prices).toEqual([]);
+      expect(s.customerGroups.every((g) => g.discountPercent === 0)).toBe(true);
+      expect(s.invoices).toEqual(lines);
+      const before = structuredClone(s);
+      expect(A.migrate(s)).toEqual(before);
+      assertInvariants(s);
+    },
+  );
+  it('rejects malformed price backups, including duplicate target keys and identifiers', () => {
+    const { s, p, customer, supplier, group } = pricing();
+    const entry = A.savePrice(s, {
+      productId: p.id,
+      unit: p.unit,
+      customerId: customer.id,
+      price: 7,
+    });
+    const changes = [
+      { productId: 'missing' },
+      { unit: 'tube' },
+      { unit: undefined },
+      { customerId: undefined },
+      { customerId: 'missing' },
+      { customerId: supplier.id },
+      { groupId: group.id },
+      { customerId: undefined, groupId: 'missing' },
+      { groupId: '' },
+      { price: 0 },
+      { price: -1 },
+      { price: '7' },
+      { price: 7.001 },
+      { note: 42 },
+    ];
+    changes.forEach((change) => {
+      const raw = structuredClone(s);
+      Object.assign(raw.prices[0], change);
+      expect(() => A.validateBackup(raw)).toThrow();
+    });
+    const duplicate = structuredClone(s);
+    duplicate.prices.push({ ...entry, id: 'another' });
+    expect(() => A.validateBackup(duplicate)).toThrow(
+      'A price already exists for this product, unit and target.',
+    );
+    const ids = structuredClone(s);
+    ids.prices.push({ ...entry });
+    expect(() => A.validateBackup(ids)).toThrow(
+      'Backup contains duplicate or missing identifiers.',
+    );
+    assertInvariants(s);
+  });
+  it('seeds six Hospital products with box and carton Paracetamol, four Clinic products, three Greenlife specials and exactly one below-cost entry', () => {
+    const s = A.seed();
+    const hospital = s.customerGroups.find((g) => g.name === 'Hospital')!;
+    const clinic = s.customerGroups.find((g) => g.name === 'Clinic')!;
+    const hospitalPrices = s.prices.filter((e) => e.groupId === hospital.id);
+    expect(new Set(hospitalPrices.map((e) => e.productId)).size).toBe(6);
+    expect(
+      hospitalPrices
+        .filter((e) => e.productId === 'p1')
+        .map((e) => e.unit)
+        .sort(),
+    ).toEqual(['box', 'carton']);
+    expect(s.prices.filter((e) => e.groupId === clinic.id)).toHaveLength(4);
+    expect(s.prices.filter((e) => e.customerId === 'c1')).toHaveLength(3);
+    expect(s.prices.some((e) => e.customerId === 'c1' && e.unit === 'carton')).toBe(true);
+    expect(s.prices.filter((e) => A.belowCost(s, e.productId, e.unit, e.price))).toHaveLength(1);
+    expect(clinic.discountPercent).toBe(3);
+    expect(hospital.discountPercent).toBe(8);
+    assertInvariants(s);
+  });
+});
+
 describe('customer accounts', () => {
   function draft(
     s: Workspace,
@@ -289,6 +599,7 @@ describe('customer accounts', () => {
     const raw = JSON.parse(JSON.stringify(A.seed()));
     raw.version = version;
     delete raw.customerGroups;
+    delete raw.prices;
     delete raw.settings.defaultPaymentTermsDays;
     delete raw.settings.overdueGraceDays;
     for (const c of raw.contacts)
@@ -2842,6 +3153,7 @@ describe('units of measure', () => {
     delete raw.adjustments;
     delete raw.counters.adjustment;
     raw.version = 1;
+    delete raw.prices;
     const migrated = A.validateBackup(raw);
     expect(migrated.products.every((p) => p.packs.length === 0)).toBe(true);
     expect(

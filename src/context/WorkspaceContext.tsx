@@ -18,6 +18,7 @@ export const pageNames: Record<Page, string> = {
   warehouses: 'Warehouses',
   purchasing: 'Purchasing',
   invoices: 'Invoices',
+  pricing: 'Price lists',
   accounting: 'Accounting',
   analytics: 'Analytics',
   contacts: 'Contacts',

@@ -6,6 +6,7 @@ import type {
   Product,
   Contact,
   CustomerGroup,
+  PriceEntry,
   Invoice,
   Purchase,
   Batch,
@@ -246,6 +247,132 @@ function unitPrice(p: Product, unit: Unit = p.unit, purchase = false): number {
   return purchase
     ? round(p.cost * factor)
     : (p.packs.find((pack) => pack.unit === unit)?.price ?? round(p.price * factor));
+}
+function priceFor(
+  s: Workspace,
+  { productId, unit, customerId }: { productId: string; unit: Unit; customerId?: string },
+): {
+  price: number;
+  source: 'customer' | 'group' | 'group_discount' | 'default';
+  entryId?: string;
+} {
+  const p = product(s, productId);
+  required(p, 'Select a product.');
+  unitFactor(p, unit);
+  const customer = contact(s, customerId || '');
+  // ponytail: no unit conversion between price entries; add if they want box prices to imply carton prices
+  const entries = s.prices.filter((e) => e.productId === productId && e.unit === unit);
+  const special =
+    customer?.type === 'Customer' && entries.find((e) => e.customerId === customer.id);
+  if (special) return { price: special.price, source: 'customer', entryId: special.id };
+  return groupPriceFor(s, {
+    productId,
+    unit,
+    groupId: customer?.type === 'Customer' ? customer.groupId : undefined,
+  });
+}
+function groupPriceFor(
+  s: Workspace,
+  { productId, unit, groupId }: { productId: string; unit: Unit; groupId?: string },
+): { price: number; source: 'group' | 'group_discount' | 'default'; entryId?: string } {
+  const p = product(s, productId);
+  required(p, 'Select a product.');
+  const defaultPrice = unitPrice(p, unit);
+  const group = s.customerGroups.find((g) => g.id === groupId);
+  const groupPrice =
+    group &&
+    s.prices.find((e) => e.productId === productId && e.unit === unit && e.groupId === group.id);
+  if (groupPrice) return { price: groupPrice.price, source: 'group', entryId: groupPrice.id };
+  if (group && group.discountPercent > 0)
+    return {
+      price: round(defaultPrice * (1 - group.discountPercent / 100)),
+      source: 'group_discount',
+    };
+  return { price: defaultPrice, source: 'default' };
+}
+function repriceLines(
+  s: Workspace,
+  lines: LineInput[],
+  oldCustomerId: string,
+  customerId: string,
+): LineInput[] {
+  return lines.map((line) => {
+    const p = product(s, line.productId);
+    const unit = line.unit || p?.unit;
+    if (!p || !unit || (unit !== p.unit && !p.packs.some((pack) => pack.unit === unit)))
+      return line;
+    const input = { productId: p.id, unit };
+    return Number(line.price) === priceFor(s, { ...input, customerId: oldCustomerId }).price
+      ? { ...line, price: priceFor(s, { ...input, customerId }).price }
+      : line;
+  });
+}
+function belowCost(s: Workspace, productId: string, unit: Unit, price: number): boolean {
+  const p = product(s, productId);
+  required(p, 'Select a product.');
+  return price < round(p.cost * unitFactor(p, unit));
+}
+function validatePrice(s: Workspace, entry: PriceEntry) {
+  const p = product(s, entry.productId);
+  required(p, 'Select a product.');
+  required(units.includes(entry.unit), `Select a valid unit for ${p.name}.`);
+  unitFactor(p, entry.unit);
+  required(
+    (entry.groupId !== undefined) !== (entry.customerId !== undefined),
+    'Select exactly one customer group or customer.',
+  );
+  if (entry.groupId !== undefined)
+    required(
+      s.customerGroups.some((g) => g.id === entry.groupId),
+      'Select a valid customer group.',
+    );
+  if (entry.customerId !== undefined)
+    required(contact(s, entry.customerId)?.type === 'Customer', 'Select a customer.');
+  required(moneyCheck(entry.price, 'Price') > 0, 'Price must be greater than 0.');
+  required(
+    entry.price === moneyCheck(entry.price, 'Price'),
+    'Price must be a number rounded to cents.',
+  );
+  required(typeof entry.note === 'string', 'Enter a valid price note.');
+  required(
+    !s.prices.some(
+      (e) =>
+        e.id !== entry.id &&
+        e.productId === entry.productId &&
+        e.unit === entry.unit &&
+        e.groupId === entry.groupId &&
+        e.customerId === entry.customerId,
+    ),
+    'A price already exists for this product, unit and target.',
+  );
+}
+function savePrice(
+  s: Workspace,
+  data: Omit<PriceEntry, 'id' | 'price' | 'note'> & { price: NumericInput; note?: string },
+  id?: string,
+) {
+  required(!id || s.prices.some((e) => e.id === id), 'Price not found.');
+  activeProduct(s, data.productId);
+  const entry: PriceEntry = {
+    id: id || uid('price'),
+    productId: data.productId,
+    unit: data.unit,
+    price: moneyCheck(data.price, 'Price'),
+    ...(data.groupId !== undefined ? { groupId: data.groupId } : {}),
+    ...(data.customerId !== undefined ? { customerId: data.customerId } : {}),
+    note: String(data.note || '').trim(),
+  };
+  validatePrice(s, entry);
+  if (id) s.prices = s.prices.map((e) => (e.id === id ? entry : e));
+  else s.prices.push(entry);
+  return entry;
+}
+function deletePrice(s: Workspace, id: string) {
+  required(
+    s.prices.some((e) => e.id === id),
+    'Price not found.',
+  );
+  s.prices = s.prices.filter((e) => e.id !== id);
 }
 function formatQty(p: Product, baseQty: number): { main: string; packs?: string } {
   const count = (qty: number, unit: Unit) =>
@@ -844,6 +971,11 @@ function saveProduct(s: Workspace, data: ProductInput, id?: string) {
   if (!p.active && previous)
     required(!inactiveReason(s, p.id), `${p.name} still has stock or open documents.`);
   validatePacks(s, p);
+  for (const entry of s.prices.filter((e) => e.productId === p.id))
+    required(
+      entry.unit === p.unit || p.packs.some((pack) => pack.unit === entry.unit),
+      'Delete price entries for this unit before removing it.',
+    );
   if (id) {
     required(product(s, id), 'Product not found.');
     s.products = s.products.map((x) => (x.id === id ? p : x));
@@ -1325,7 +1457,25 @@ function createInvoice(s: Workspace, data: InvoiceInput, id?: string) {
     due = dateCheck(data.due ?? shift(contact(s, data.customerId)!.paymentTermsDays, date));
   required(due >= date, 'Due date must be on or after the invoice date.');
   required(date <= today(), 'Invoice date cannot be in the future.');
-  const lines = normalizedLines(s, data.lines),
+  required(Array.isArray(data.lines) && data.lines.length, 'Add at least one product.');
+  const lines = normalizedLines(
+      s,
+      data.lines.map((line) => {
+        const p = product(s, line.productId);
+        return {
+          ...line,
+          price:
+            line.price ??
+            (p
+              ? priceFor(s, {
+                  productId: p.id,
+                  unit: line.unit || p.unit,
+                  customerId: data.customerId,
+                }).price
+              : undefined),
+        };
+      }),
+    ),
     amounts = totals(lines, data.discount, data.taxRate);
   required(amounts.total > 0, 'Invoice total must be greater than zero.');
   const previous = id ? s.invoices.find((i) => i.id === id) : null;
@@ -1806,6 +1956,7 @@ function deleteCustomerGroup(s: Workspace, id: string) {
   const count = s.contacts.filter((c) => c.type === 'Customer' && c.groupId === id).length;
   required(count === 0, `${group.name} is used by ${count} customers.`);
   s.customerGroups = s.customerGroups.filter((g) => g.id !== id);
+  s.prices = s.prices.filter((e) => e.groupId !== id);
 }
 function saveContact(s: Workspace, data: ContactInput, id?: string) {
   required(['Customer', 'Supplier'].includes(data.type), 'Select a contact type.');
@@ -1856,6 +2007,7 @@ function saveContact(s: Workspace, data: ContactInput, id?: string) {
           ...s.purchases.map((p) => p.supplierId),
           ...s.receipts.map((r) => r.supplierId),
           ...s.products.map((p) => p.supplierId),
+          ...s.prices.map((e) => e.customerId),
         ].includes(id),
       'This contact has transaction history, so its type cannot be changed.',
     );
@@ -1923,6 +2075,7 @@ function emptyWorkspace(s: Workspace): Workspace {
     batches: [],
     contacts: [],
     customerGroups: [],
+    prices: [],
     invoices: [],
     purchases: [],
     receipts: [],
@@ -1979,6 +2132,7 @@ function seed(): Workspace {
     journal: [],
     contacts: [],
     customerGroups: [],
+    prices: [],
     warehouses: [
       {
         id: 'wh_main',
@@ -2892,6 +3046,21 @@ function seed(): Workspace {
     notes: 'Blood pressure monitors for the pharmacy expansion; payment on account.',
   });
   issueInvoice(s, accountSale.id);
+  for (const productId of ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']) {
+    const p = product(s, productId)!;
+    savePrice(s, { productId, unit: p.unit, price: round(p.price * 0.88), groupId: hospital.id });
+  }
+  savePrice(s, { productId: 'p1', unit: 'carton', price: 250, groupId: hospital.id });
+  for (const productId of ['p1', 'p2', 'p3', 'p4']) {
+    const p = product(s, productId)!;
+    savePrice(s, { productId, unit: p.unit, price: round(p.price * 0.95), groupId: clinic.id });
+  }
+  for (const [productId, unit, price] of [
+    ['p1', 'carton', 240],
+    ['p1', 'box', 5.1],
+    ['p4', 'box', 4.9],
+  ] as const)
+    savePrice(s, { productId, unit, price, customerId: 'c1', note: 'Agreed volume price.' });
   return s;
 }
 function migrate(raw: unknown): Workspace {
@@ -2930,6 +3099,11 @@ function migrate(raw: unknown): Workspace {
   if (s.reservations === undefined) s.reservations = [];
   if (s.counters.reservation === undefined) s.counters.reservation = 1;
   if (s.customerGroups === undefined) s.customerGroups = [];
+  if (s.prices === undefined) s.prices = [];
+  if (Array.isArray(s.customerGroups))
+    s.customerGroups.forEach((g) => {
+      if (g.discountPercent === undefined) g.discountPercent = 0;
+    });
   if (s.settings) {
     if (s.settings.defaultPaymentTermsDays === undefined) s.settings.defaultPaymentTermsDays = 30;
     if (s.settings.overdueGraceDays === undefined) s.settings.overdueGraceDays = 7;
@@ -3000,6 +3174,7 @@ function validateBackup(value: unknown): Workspace {
     'reorderRules',
     'reservations',
     'customerGroups',
+    'prices',
   ])
     required(Array.isArray(s[key as keyof Workspace]), 'Backup is missing ' + key + '.');
   required(s.settings && s.counters, 'Backup settings are missing.');
@@ -3017,6 +3192,7 @@ function validateBackup(value: unknown): Workspace {
       'recalls',
       'reservations',
       'customerGroups',
+      'prices',
     ] as const
   ).forEach((key) => {
     ids[key] = new Set();
@@ -3051,6 +3227,7 @@ function validateBackup(value: unknown): Workspace {
     );
   });
   const reorderPairs = new Set<string>();
+  s.prices.forEach((entry) => validatePrice(s, entry));
   const reservationNumbers = new Set<string>();
   s.reservations.forEach((r) => {
     required(
@@ -3556,6 +3733,12 @@ export const A = {
   unitLabel,
   unitFactor,
   unitPrice,
+  priceFor,
+  groupPriceFor,
+  repriceLines,
+  savePrice,
+  deletePrice,
+  belowCost,
   formatQty,
   findBarcode,
   validatePacks,
