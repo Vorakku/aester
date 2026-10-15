@@ -107,6 +107,10 @@ export function SettingsPage() {
               onSubmit={(data) =>
                 mutate((draft) => {
                   A.setMinShelfLife(draft, data.minShelfLifeDays);
+                  A.setAccountSettings(draft, {
+                    defaultPaymentTermsDays: data.defaultPaymentTermsDays,
+                    overdueGraceDays: data.overdueGraceDays,
+                  });
                   const taxRate = Number(data.taxRate),
                     expiryWindow = Number(data.expiryWindow),
                     invoicePrefix = String(data.invoicePrefix || '')
@@ -138,6 +142,26 @@ export function SettingsPage() {
                 <Field label="Phone number" name="phone" defaultValue={s.phone} />
                 <Field label="Business address" name="address" defaultValue={s.address} full />
                 <Field label="Invoice prefix" name="invoicePrefix" defaultValue={s.invoicePrefix} />
+                <Field
+                  label="Default payment terms (days)"
+                  name="defaultPaymentTermsDays"
+                  type="number"
+                  defaultValue={s.defaultPaymentTermsDays}
+                  min="0"
+                  max="365"
+                  step="1"
+                  required
+                />
+                <Field
+                  label="Overdue grace period (days)"
+                  name="overdueGraceDays"
+                  type="number"
+                  defaultValue={s.overdueGraceDays}
+                  min="0"
+                  max="365"
+                  step="1"
+                  required
+                />
                 <Field
                   label="Default invoice tax (%)"
                   name="taxRate"

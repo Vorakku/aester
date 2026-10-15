@@ -6,6 +6,7 @@ import { initials, money } from '../lib/format';
 import { Button, Callout, Empty, Icon, IconButton, ProductArt, useStockAlerts } from './ui';
 import {
   ContactForm,
+  ContactHoldForm,
   AdjustmentForm,
   ExpenseForm,
   PaymentForm,
@@ -246,6 +247,7 @@ function DialogContents({ dialog }: { dialog: Dialog }) {
     'expense-form': <ExpenseForm />,
     'contact-form': <ContactForm id={id || undefined} />,
     'contact-detail': <ContactDetail id={id} />,
+    'contact-hold': <ContactHoldForm id={id} />,
     help: <HelpContent />,
     alerts: <StockAlerts />,
     search: <SearchDialog />,
@@ -341,6 +343,10 @@ export function DialogHost() {
       'Keep customers and suppliers close at hand.',
     ],
     'contact-detail': [A.contact(state, id)?.name || 'Contact', A.contact(state, id)?.type || ''],
+    'contact-hold': [
+      A.contact(state, id)?.onHold ? 'Release hold' : 'Put on hold',
+      A.contact(state, id)?.name || 'Customer',
+    ],
     help: ['Meet your pharmacy workspace', 'One place for a clearer day.'],
     alerts: ['Your stock alerts', 'Keep tomorrow’s operations running smoothly.'],
     search: ['Search workspace', 'Find products, invoices, and contacts.'],

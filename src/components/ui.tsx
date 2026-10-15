@@ -187,6 +187,7 @@ export function StockQuantity({ product, qty }: { product?: Product; qty: number
 export function Badge({ status }: { status: string }) {
   const tone = [
     'Paid',
+    'OK',
     'In stock',
     'Active',
     'Received',
@@ -215,6 +216,8 @@ export function Badge({ status }: { status: string }) {
             'Out of stock',
             'Expired',
             'Overdue',
+            'On hold',
+            'Over limit',
             'Recalled',
             'Over-reserved',
             'sale',

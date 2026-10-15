@@ -27,6 +27,7 @@ import { CountFreezeBanner, StockCountsTable } from '../components/stockCounts';
 import { ControlledRegister } from '../components/ControlledRegister';
 import { RecallsTable } from '../components/recalls';
 import { ReorderSuggestions } from '../components/reorder';
+import { CustomerGroups } from '../components/forms';
 
 export function ExportButton({
   type,
@@ -1065,6 +1066,7 @@ export function InvoicesPage() {
 }
 export function ContactsPage() {
   const { state, open } = useWorkspace();
+  const [tab, setTab] = useState('contacts');
   const [q, setQ] = useState(''),
     [type, setType] = useState('');
   const items = state.contacts.filter(
@@ -1099,75 +1101,93 @@ export function ContactsPage() {
           foot="Outstanding accounts receivable"
         />
       </div>
-      <section className="panel">
-        <div className="toolbar">
-          <div className="toolbar-left">
-            <SearchInput value={q} onChange={setQ} placeholder="Search name, email or phone..." />
-            <Filter
-              label="Contact type"
-              value={type}
-              onChange={setType}
-              items={['Customer', 'Supplier']}
-              placeholder="All contacts"
-            />
+      <div className="tabs">
+        <button className={tab === 'contacts' ? 'active' : ''} onClick={() => setTab('contacts')}>
+          Contacts
+        </button>
+        <button className={tab === 'groups' ? 'active' : ''} onClick={() => setTab('groups')}>
+          Customer groups
+        </button>
+      </div>
+      {tab === 'groups' ? (
+        <section className="panel">
+          <CustomerGroups />
+        </section>
+      ) : (
+        <section className="panel">
+          <div className="toolbar">
+            <div className="toolbar-left">
+              <SearchInput value={q} onChange={setQ} placeholder="Search name, email or phone..." />
+              <Filter
+                label="Contact type"
+                value={type}
+                onChange={setType}
+                items={['Customer', 'Supplier']}
+                placeholder="All contacts"
+              />
+            </div>
+            <ExportButton type="contacts" />
           </div>
-          <ExportButton type="contacts" />
-        </div>
-        <DataTable
-          items={items}
-          filterKey={`${q}|${type}`}
-          columns={['Contact', 'Type', 'Email / phone', 'Location', 'Balance', '']}
-          row={(c) => {
-            const balance =
-              c.type === 'Customer'
-                ? A.sum(
-                    state.invoices.filter((i) => i.customerId === c.id),
-                    A.invoiceBalance,
-                  )
-                : A.sum(
-                    [
-                      ...state.purchases.filter((p) => p.status === 'Received'),
-                      ...state.receipts,
-                    ].filter((p) => p.supplierId === c.id),
-                    (p) => p.total - p.paid,
-                  );
-            return (
-              <tr key={c.id}>
-                <td>
-                  <button
-                    className="table-product text-left p-0"
-                    onClick={() => open('contact-detail', c.id)}
-                  >
-                    <span className="contact-initials">{initials(c.name)}</span>
-                    <div>
-                      <strong>{c.name}</strong>
-                      <small>{c.person}</small>
-                    </div>
-                  </button>
-                </td>
-                <td>
-                  <Badge status={c.type} />
-                </td>
-                <td>
-                  {c.email}
-                  <div className="muted text-[9px] mt-[5px]">{c.phone}</div>
-                </td>
-                <td>{c.address}</td>
-                <td>
-                  <strong>{money(balance)}</strong>
-                </td>
-                <td>
-                  <IconButton
-                    name="edit"
-                    label={`Edit ${c.name}`}
-                    onClick={() => open('contact-form', c.id)}
-                  />
-                </td>
-              </tr>
-            );
-          }}
-        />
-      </section>
+          <DataTable
+            items={items}
+            filterKey={`${q}|${type}`}
+            columns={['Contact', 'Type', 'Group', 'Email / phone', 'Location', 'Balance', '']}
+            row={(c) => {
+              const balance =
+                c.type === 'Customer'
+                  ? A.sum(
+                      state.invoices.filter((i) => i.customerId === c.id),
+                      A.invoiceBalance,
+                    )
+                  : A.sum(
+                      [
+                        ...state.purchases.filter((p) => p.status === 'Received'),
+                        ...state.receipts,
+                      ].filter((p) => p.supplierId === c.id),
+                      (p) => p.total - p.paid,
+                    );
+              return (
+                <tr key={c.id}>
+                  <td>
+                    <button
+                      className="table-product text-left p-0"
+                      onClick={() => open('contact-detail', c.id)}
+                    >
+                      <span className="contact-initials">{initials(c.name)}</span>
+                      <div>
+                        <strong>{c.name}</strong>
+                        <small>{c.person}</small>
+                      </div>
+                    </button>
+                  </td>
+                  <td>
+                    <Badge status={c.type} />
+                    {c.type === 'Customer' && A.customerAccountStatus(state, c.id) !== 'OK' && (
+                      <Badge status={A.customerAccountStatus(state, c.id)} />
+                    )}
+                  </td>
+                  <td>{state.customerGroups.find((g) => g.id === c.groupId)?.name || '—'}</td>
+                  <td>
+                    {c.email}
+                    <div className="muted text-[9px] mt-[5px]">{c.phone}</div>
+                  </td>
+                  <td>{c.address}</td>
+                  <td>
+                    <strong>{money(balance)}</strong>
+                  </td>
+                  <td>
+                    <IconButton
+                      name="edit"
+                      label={`Edit ${c.name}`}
+                      onClick={() => open('contact-form', c.id)}
+                    />
+                  </td>
+                </tr>
+              );
+            }}
+          />
+        </section>
+      )}
     </>
   );
 }

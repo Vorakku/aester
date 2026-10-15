@@ -13,6 +13,11 @@ function assertInvariants(s: Workspace) {
   s.journal.forEach((j) => {
     expect(A.sum(j.entries, (e) => e.debit)).toBe(A.sum(j.entries, (e) => e.credit));
   });
+  s.invoices.forEach((i) => {
+    expect(i.paid).toBe(A.sum(i.payments, (p) => p.amount));
+    expect(A.round(i.total - i.paid)).toBeGreaterThanOrEqual(0);
+  });
+  expect(A.balances(s).receivable.balance).toBe(A.sum(s.invoices, A.invoiceBalance));
   expect(A.validateBackup(JSON.parse(JSON.stringify(s)))).toEqual(s);
 }
 function empty(): Workspace {
@@ -74,6 +79,346 @@ function stocked() {
   });
   return { s, supplier, customer, p, late, early };
 }
+describe('customer accounts', () => {
+  function draft(
+    s: Workspace,
+    customerId: string,
+    productId: string,
+    date = A.today(),
+    due?: string,
+  ) {
+    return A.createInvoice(s, { customerId, date, due, lines: [{ productId, qty: 1 }] });
+  }
+  it.each([0, 30, 60, 365])(
+    'defaults the due date to invoice date plus %i days and allows a chosen due date',
+    (terms) => {
+      const { s, customer, p } = stocked();
+      A.saveContact(s, { ...customer, paymentTermsDays: terms }, customer.id);
+      const date = A.shift(-5);
+      expect(draft(s, customer.id, p.id, date).due).toBe(A.shift(terms, date));
+      expect(draft(s, customer.id, p.id, date, A.shift(10, date)).due).toBe(A.shift(10, date));
+      assertInvariants(s);
+    },
+  );
+  it('blocks a held account with its reason', () => {
+    const { s, customer } = stocked();
+    A.saveContact(
+      s,
+      { ...customer, onHold: true, holdReason: ' Cheque returned unpaid ' },
+      customer.id,
+    );
+    expect(A.creditCheck(s, customer.id, 5)).toEqual({
+      ok: false,
+      reasons: ['Account on hold: Cheque returned unpaid.'],
+      exposure: 5,
+      limit: null,
+      overdue: 0,
+    });
+    assertInvariants(s);
+  });
+  it('blocks above the limit, permits the exact limit, and excludes drafts from exposure', () => {
+    const { s, customer, p } = stocked();
+    const invoice = draft(s, customer.id, p.id);
+    A.issueInvoice(s, invoice.id);
+    A.payInvoice(s, invoice.id, 2, 'Cash', A.today());
+    draft(s, customer.id, p.id);
+    A.saveContact(s, { ...customer, creditLimit: 10 }, customer.id);
+    expect(A.creditCheck(s, customer.id, 7)).toMatchObject({ ok: true, exposure: 10, limit: 10 });
+    expect(A.creditCheck(s, customer.id, 8)).toMatchObject({
+      ok: false,
+      exposure: 11,
+      reasons: ['Credit limit $10.00 exceeded (exposure $11.00).'],
+    });
+    assertInvariants(s);
+  });
+  it('never blocks an unlimited customer by amount and blocks any credit sale with a zero limit', () => {
+    const { s, customer } = stocked();
+    expect(A.creditCheck(s, customer.id, 100000000).ok).toBe(true);
+    A.saveContact(s, { ...customer, creditLimit: 0 }, customer.id);
+    expect(A.creditCheck(s, customer.id, 0).ok).toBe(true);
+    expect(A.creditCheck(s, customer.id, 0.01)).toMatchObject({
+      ok: false,
+      exposure: 0.01,
+      limit: 0,
+    });
+    assertInvariants(s);
+  });
+  it('blocks overdue balances beyond grace, permits the grace boundary, and ignores paid invoices and drafts', () => {
+    const { s, customer, p } = stocked();
+    const old = draft(s, customer.id, p.id, A.shift(-30), A.shift(-7));
+    A.issueInvoice(s, old.id);
+    draft(s, customer.id, p.id, A.shift(-30), A.shift(-20));
+    expect(A.creditCheck(s, customer.id, 0)).toMatchObject({ ok: true, overdue: 0 });
+    A.setAccountSettings(s, { defaultPaymentTermsDays: 30, overdueGraceDays: 6 });
+    A.payInvoice(s, old.id, 2, 'Cash', A.today());
+    expect(A.creditCheck(s, customer.id, 0)).toMatchObject({
+      ok: false,
+      overdue: 3,
+      reasons: ['$3.00 is overdue by more than 6 days.'],
+    });
+    A.payInvoice(s, old.id, 3, 'Cash', A.today());
+    expect(A.creditCheck(s, customer.id, 0).ok).toBe(true);
+    assertInvariants(s);
+  });
+  it('lists every applicable reason and overrides an issue atomically with a recorded user, timestamp, and reason', () => {
+    const { s, customer, p } = stocked();
+    const old = draft(s, customer.id, p.id, A.shift(-30), A.shift(-8));
+    A.issueInvoice(s, old.id);
+    A.saveContact(
+      s,
+      { ...customer, creditLimit: 5, onHold: true, holdReason: 'Cheque returned unpaid' },
+      customer.id,
+    );
+    const invoice = draft(s, customer.id, p.id);
+    const reasons = [
+      'Account on hold: Cheque returned unpaid.',
+      'Credit limit $5.00 exceeded (exposure $10.00).',
+      '$5.00 is overdue by more than 7 days.',
+    ];
+    expect(A.creditCheck(s, customer.id, invoice.total).reasons).toEqual(reasons);
+    const before = structuredClone(s);
+    expect(() => A.transact(s, (copy) => A.issueInvoice(copy, invoice.id))).toThrow(
+      reasons.join(' '),
+    );
+    expect(s).toEqual(before);
+    for (const reason of ['', ' abcd ']) {
+      expect(() => A.transact(s, (copy) => A.issueInvoice(copy, invoice.id, { reason }))).toThrow(
+        'Enter an override reason of at least 5 characters.',
+      );
+      expect(s).toEqual(before);
+    }
+    assertInvariants(s);
+    const result = A.transact(s, (copy) =>
+      A.issueInvoice(copy, invoice.id, { reason: ' Manager approved collection ' }),
+    );
+    const issued = result.state.invoices.find((i) => i.id === invoice.id)!;
+    expect(issued.status).toBe('Issued');
+    expect(issued.creditOverride).toEqual({
+      by: CURRENT_USER,
+      at: expect.any(String),
+      reason: 'Manager approved collection',
+      reasons,
+    });
+    expect(new Date(issued.creditOverride!.at).toISOString()).toBe(issued.creditOverride!.at);
+    assertInvariants(result.state);
+  });
+  it('manages trimmed, unique group names and prevents deleting groups used by customers', () => {
+    const { s, customer } = stocked();
+    const group = A.saveCustomerGroup(s, { name: ' Pharmacy ' });
+    expect(group).toMatchObject({ name: 'Pharmacy', discountPercent: 0 });
+    expect(group.id.startsWith('grp_')).toBe(true);
+    expect(() => A.saveCustomerGroup(s, { name: 'phARMacy' })).toThrow(
+      'Customer group names must be unique.',
+    );
+    const other = A.saveCustomerGroup(s, { name: 'Clinic' });
+    expect(() => A.saveCustomerGroup(s, { name: ' Pharmacy ' }, other.id)).toThrow(
+      'Customer group names must be unique.',
+    );
+    A.saveContact(s, { ...customer, groupId: group.id }, customer.id);
+    expect(() => A.deleteCustomerGroup(s, group.id)).toThrow('Pharmacy is used by 1 customers.');
+    A.saveCustomerGroup(s, { name: 'Retail pharmacy' }, group.id);
+    A.deleteCustomerGroup(s, other.id);
+    expect(s.customerGroups).toHaveLength(1);
+    A.saveContact(s, { ...customer, groupId: '' }, customer.id);
+    A.deleteCustomerGroup(s, group.id);
+    expect(s.customerGroups).toEqual([]);
+    assertInvariants(s);
+  });
+  it('validates account fields, supplier defaults, group ranges, and settings in model operations', () => {
+    const { s, customer, supplier } = stocked();
+    for (const patch of [
+      { paymentTermsDays: -1 },
+      { paymentTermsDays: 366 },
+      { paymentTermsDays: 1.5 },
+      { creditLimit: -1 },
+      { creditLimit: Infinity },
+      { onHold: true, holdReason: ' ' },
+      { groupId: 'missing' },
+      { billing: 'invalid' as typeof customer.billing },
+    ]) {
+      const before = structuredClone(s);
+      expect(() =>
+        A.transact(s, (copy) => A.saveContact(copy, { ...customer, ...patch }, customer.id)),
+      ).toThrow();
+      expect(s).toEqual(before);
+    }
+    for (const name of ['x', 'a'.repeat(41)])
+      expect(() => A.saveCustomerGroup(s, { name })).toThrow();
+    for (const discountPercent of [-1, 101, NaN])
+      expect(() => A.saveCustomerGroup(s, { name: 'Invalid discount', discountPercent })).toThrow();
+    A.setAccountSettings(s, { defaultPaymentTermsDays: 45, overdueGraceDays: 0 });
+    const c = A.saveContact(s, {
+      ...supplier,
+      type: 'Customer',
+      name: 'New customer',
+      paymentTermsDays: undefined,
+    });
+    expect(c.paymentTermsDays).toBe(45);
+    const saved = A.saveContact(
+      s,
+      {
+        ...supplier,
+        groupId: 'invalid',
+        paymentTermsDays: -1,
+        creditLimit: -1,
+        onHold: true,
+        holdReason: '',
+        billing: 'monthly',
+      },
+      supplier.id,
+    );
+    expect(saved).toMatchObject({
+      groupId: '',
+      paymentTermsDays: 45,
+      creditLimit: null,
+      onHold: false,
+      holdReason: '',
+      billing: 'per_delivery',
+    });
+    for (const value of [-1, 366, 0.5]) {
+      expect(() =>
+        A.setAccountSettings(s, { defaultPaymentTermsDays: value, overdueGraceDays: 7 }),
+      ).toThrow();
+      expect(() =>
+        A.setAccountSettings(s, { defaultPaymentTermsDays: 30, overdueGraceDays: value }),
+      ).toThrow();
+    }
+    assertInvariants(s);
+  });
+  it.each([1, 2])('migrates v%i account defaults idempotently and loads old backups', (version) => {
+    const raw = JSON.parse(JSON.stringify(A.seed()));
+    raw.version = version;
+    delete raw.customerGroups;
+    delete raw.settings.defaultPaymentTermsDays;
+    delete raw.settings.overdueGraceDays;
+    for (const c of raw.contacts)
+      for (const field of [
+        'groupId',
+        'paymentTermsDays',
+        'creditLimit',
+        'onHold',
+        'holdReason',
+        'billing',
+      ])
+        delete c[field];
+    const stored = JSON.stringify(raw);
+    const s = A.validateBackup(raw);
+    expect(s.customerGroups).toEqual([]);
+    expect(s.settings).toMatchObject({ defaultPaymentTermsDays: 30, overdueGraceDays: 7 });
+    s.contacts.forEach((c) =>
+      expect(c).toMatchObject({
+        groupId: '',
+        paymentTermsDays: 30,
+        creditLimit: null,
+        onHold: false,
+        holdReason: '',
+        billing: 'per_delivery',
+      }),
+    );
+    const before = structuredClone(s);
+    expect(A.migrate(s)).toEqual(before);
+    assertInvariants(s);
+    vi.stubGlobal('localStorage', { getItem: () => stored });
+    try {
+      assertInvariants(A.load());
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+  it('preserves existing account settings and uses a migrated company default for missing contact terms', () => {
+    const raw = JSON.parse(JSON.stringify(A.seed()));
+    raw.settings.defaultPaymentTermsDays = 45;
+    delete raw.contacts[0].paymentTermsDays;
+    const s = A.migrate(raw);
+    expect(s.contacts[0].paymentTermsDays).toBe(45);
+    expect(A.contact(s, 'c5')!.paymentTermsDays).toBe(60);
+    const before = structuredClone(s);
+    expect(A.migrate(s)).toEqual(before);
+    assertInvariants(s);
+  });
+  it('rejects malformed account backups and credit overrides', () => {
+    const { s, customer, p } = stocked();
+    const group = A.saveCustomerGroup(s, { name: 'Pharmacy' });
+    A.saveContact(
+      s,
+      { ...customer, groupId: group.id, onHold: true, holdReason: 'Awaiting cheque clearance' },
+      customer.id,
+    );
+    const invoice = draft(s, customer.id, p.id);
+    A.issueInvoice(s, invoice.id, { reason: 'Approved by manager' });
+    for (const patch of [
+      { paymentTermsDays: -1 },
+      { paymentTermsDays: 366 },
+      { paymentTermsDays: 0.5 },
+      { creditLimit: -1 },
+      { creditLimit: '5' },
+      { groupId: 'missing' },
+      { onHold: 'yes' },
+      { holdReason: ' ' },
+      { billing: 'invalid' },
+    ]) {
+      const bad = structuredClone(s);
+      Object.assign(
+        bad.contacts.find((c) => c.id === customer.id)!,
+        patch,
+      );
+      expect(() => A.validateBackup(bad)).toThrow();
+    }
+    for (const patch of [
+      { name: 'x' },
+      { name: 'a'.repeat(41) },
+      { name: ' Pharmacy ' },
+      { discountPercent: -1 },
+      { discountPercent: 101 },
+    ]) {
+      const bad = structuredClone(s);
+      Object.assign(bad.customerGroups[0], patch);
+      expect(() => A.validateBackup(bad)).toThrow();
+    }
+    const duplicate = structuredClone(s);
+    duplicate.customerGroups.push({ ...group, id: 'other', name: 'pHARMACY' });
+    expect(() => A.validateBackup(duplicate)).toThrow();
+    for (const key of ['defaultPaymentTermsDays', 'overdueGraceDays'] as const)
+      for (const value of [-1, 366, 1.5]) {
+        const bad = structuredClone(s);
+        bad.settings[key] = value;
+        expect(() => A.validateBackup(bad)).toThrow();
+      }
+    for (const patch of [{ by: '' }, { reason: ' ' }, { at: 'invalid' }, { reasons: null }]) {
+      const bad = structuredClone(s);
+      Object.assign(bad.invoices[0].creditOverride!, patch);
+      expect(() => A.validateBackup(bad)).toThrow('Backup contains an invalid credit override.');
+    }
+    assertInvariants(s);
+  });
+  it('seeds groups, customer terms, limits, billing, a held customer, and Greenlife near its limit', () => {
+    const s = A.seed();
+    expect(s.customerGroups.map((g) => [g.name, g.discountPercent])).toEqual([
+      ['Pharmacy', 0],
+      ['Clinic', 3],
+      ['Hospital', 8],
+    ]);
+    for (const [id, name, terms, limit, billing] of [
+      ['c1', 'Pharmacy', 30, 3000, 'per_delivery'],
+      ['c2', 'Clinic', 30, 5000, 'monthly'],
+      ['c3', 'Clinic', 30, 5000, 'per_delivery'],
+      ['c4', 'Pharmacy', 0, 0, 'per_delivery'],
+      ['c5', 'Hospital', 60, null, 'monthly'],
+    ] as const) {
+      const c = A.contact(s, id)!;
+      expect(s.customerGroups.find((g) => g.id === c.groupId)?.name).toBe(name);
+      expect(c).toMatchObject({ paymentTermsDays: terms, creditLimit: limit, billing });
+    }
+    expect(A.contact(s, 'c2')).toMatchObject({
+      onHold: true,
+      holdReason: 'Cheque returned unpaid',
+    });
+    expect(A.creditCheck(s, 'c1', 0).exposure).toBeGreaterThan(2700);
+    expect(A.creditCheck(s, 'c1', 0).exposure).toBeLessThan(3000);
+    assertInvariants(s);
+  });
+});
+
 describe('workspace recovery', () => {
   it('empties every collection and resets counters while keeping settings and warehouses', () => {
     const seed = A.seed();

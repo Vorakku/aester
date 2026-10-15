@@ -50,6 +50,7 @@ export type DialogKind =
   | 'expense-form'
   | 'contact-form'
   | 'contact-detail'
+  | 'contact-hold'
   | 'help'
   | 'alerts'
   | 'search'

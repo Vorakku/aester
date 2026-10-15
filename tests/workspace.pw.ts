@@ -6,6 +6,62 @@ async function saved(page: Page) {
   );
 }
 
+test('a customer hold blocks invoice issue with its reason and records an override before issuing', async ({
+  page,
+}) => {
+  await page.goto('/#contacts');
+  await page
+    .getByRole('button', { name: /Greenlife Pharmacy/ })
+    .first()
+    .click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByRole('heading', { name: 'Account', exact: true })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Put on hold', exact: true }).click();
+  await dialog.getByLabel('Hold reason').fill('Cheque awaiting clearance');
+  await dialog.getByRole('button', { name: 'Put on hold', exact: true }).click();
+  await expect(dialog.getByText('On hold', { exact: true })).toBeVisible();
+  expect((await saved(page)).contacts.find((c: { id: string }) => c.id === 'c1')).toMatchObject({
+    onHold: true,
+    holdReason: 'Cheque awaiting clearance',
+  });
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  await page.goto('/#invoices');
+  await page.getByRole('button', { name: 'New invoice', exact: true }).click();
+  await dialog.getByLabel('Customer', { exact: false }).selectOption('c1');
+  const date = await dialog.getByLabel('Invoice date').inputValue();
+  const due = new Date(`${date}T12:00:00`);
+  due.setDate(due.getDate() + 30);
+  const dueDate = `${due.getFullYear()}-${String(due.getMonth() + 1).padStart(2, '0')}-${String(due.getDate()).padStart(2, '0')}`;
+  await expect(dialog.getByLabel('Due date')).toHaveValue(dueDate);
+  await dialog.getByLabel('Line product', { exact: true }).selectOption('p1');
+  await dialog.getByLabel('Line quantity', { exact: true }).fill('1');
+  const before = await saved(page);
+  await dialog.getByRole('button', { name: 'Issue invoice', exact: true }).click();
+  await expect(dialog.getByRole('alert')).toContainText(
+    'Account on hold: Cheque awaiting clearance.',
+  );
+  await expect(
+    dialog.getByRole('button', { name: 'Override and issue', exact: true }),
+  ).toBeVisible();
+  expect(await saved(page)).toEqual(before);
+  await dialog.getByLabel('Override reason').fill('Manager approved this collection');
+  await dialog.getByRole('button', { name: 'Override and issue', exact: true }).click();
+  await expect(dialog.getByRole('button', { name: 'Record payment', exact: true })).toBeVisible();
+  const after = await saved(page);
+  expect(after.invoices[0]).toMatchObject({
+    status: 'Issued',
+    customerId: 'c1',
+    creditOverride: {
+      by: 'Krisstoff',
+      reason: 'Manager approved this collection',
+      reasons: ['Account on hold: Cheque awaiting clearance.'],
+    },
+  });
+  expect(new Date(after.invoices[0].creditOverride.at).toISOString()).toBe(
+    after.invoices[0].creditOverride.at,
+  );
+});
+
 test('unreadable workspace data remains downloadable after navigation, mutations and reload', async ({
   page,
 }) => {

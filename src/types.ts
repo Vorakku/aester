@@ -162,6 +162,17 @@ export interface Contact {
   phone: string;
   address: string;
   minShelfLifeDays: number | null;
+  groupId: string;
+  paymentTermsDays: number;
+  creditLimit: number | null;
+  onHold: boolean;
+  holdReason: string;
+  billing: 'per_delivery' | 'monthly';
+}
+export interface CustomerGroup {
+  id: string;
+  name: string;
+  discountPercent: number;
 }
 export interface Recall {
   id: string;
@@ -247,6 +258,7 @@ export interface Allocation {
   cost: number;
 }
 export interface Invoice extends Totals {
+  creditOverride?: { by: string; at: string; reason: string; reasons: string[] };
   allowShortDated: boolean;
   id: string;
   number: string;
@@ -316,6 +328,8 @@ export interface Journal {
   entries: JournalLine[];
 }
 export interface Settings {
+  defaultPaymentTermsDays: number;
+  overdueGraceDays: number;
   minShelfLifeDays: number;
   company: string;
   address: string;
@@ -342,6 +356,7 @@ export interface Workspace {
   products: Product[];
   batches: Batch[];
   contacts: Contact[];
+  customerGroups: CustomerGroup[];
   warehouses: Warehouse[];
   invoices: Invoice[];
   purchases: Purchase[];
@@ -399,9 +414,16 @@ export type ProductInput = Omit<
     reorder: NumericInput;
     packs?: PackInput[];
   };
-export type ContactInput = Omit<Contact, 'id' | 'minShelfLifeDays'> & {
-  minShelfLifeDays?: NumericInput | null;
-};
+type CustomerAccountFields = Pick<Contact, 'groupId' | 'onHold' | 'holdReason' | 'billing'>;
+export type ContactInput = Omit<
+  Contact,
+  'id' | 'minShelfLifeDays' | 'paymentTermsDays' | 'creditLimit' | keyof CustomerAccountFields
+> &
+  Partial<CustomerAccountFields> & {
+    minShelfLifeDays?: NumericInput | null;
+    paymentTermsDays?: NumericInput;
+    creditLimit?: NumericInput | null;
+  };
 export interface StockInput {
   productId: string;
   unit?: Unit;
@@ -421,7 +443,7 @@ export interface InvoiceInput {
   allowShortDated?: boolean;
   customerId: string;
   date: string;
-  due: string;
+  due?: string;
   lines: LineInput[];
   discount?: NumericInput;
   taxRate?: NumericInput;

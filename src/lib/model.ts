@@ -5,6 +5,7 @@ import type {
   AccountType,
   Product,
   Contact,
+  CustomerGroup,
   Invoice,
   Purchase,
   Batch,
@@ -1321,7 +1322,7 @@ function createInvoice(s: Workspace, data: InvoiceInput, id?: string) {
   );
   required(contact(s, data.customerId)?.type === 'Customer', 'Select a customer.');
   const date = dateCheck(data.date),
-    due = dateCheck(data.due);
+    due = dateCheck(data.due ?? shift(contact(s, data.customerId)!.paymentTermsDays, date));
   required(due >= date, 'Due date must be on or after the invoice date.');
   required(date <= today(), 'Invoice date cannot be in the future.');
   const lines = normalizedLines(s, data.lines),
@@ -1390,9 +1391,58 @@ function createInvoice(s: Workspace, data: InvoiceInput, id?: string) {
   }
   return invoice;
 }
-function issueInvoice(s: Workspace, id: string) {
+function creditCheck(
+  s: Workspace,
+  customerId: string,
+  addAmount: number,
+): {
+  ok: boolean;
+  reasons: string[];
+  exposure: number;
+  limit: number | null;
+  overdue: number;
+} {
+  const c = contact(s, customerId);
+  required(c?.type === 'Customer', 'Select a customer.');
+  const invoices = s.invoices.filter((i) => i.customerId === customerId);
+  let exposure = sum(invoices, invoiceBalance);
+  // 003: add confirmed but undelivered order lines.
+  // 005: add deliveries not yet invoiced.
+  // 007: subtract available customer credit.
+  exposure = round(exposure + moneyCheck(addAmount));
+  const overdue = sum(
+    invoices.filter((i) => i.status === 'Issued' && daysLeft(i.due) < -s.settings.overdueGraceDays),
+    invoiceBalance,
+  );
+  const reasons: string[] = [];
+  if (c.onHold) reasons.push(`Account on hold: ${c.holdReason}.`);
+  if (c.creditLimit !== null && exposure > c.creditLimit)
+    reasons.push(
+      `Credit limit $${c.creditLimit.toFixed(2)} exceeded (exposure $${exposure.toFixed(2)}).`,
+    );
+  if (overdue > 0)
+    reasons.push(
+      `$${overdue.toFixed(2)} is overdue by more than ${s.settings.overdueGraceDays} days.`,
+    );
+  return { ok: reasons.length === 0, reasons, exposure, limit: c.creditLimit, overdue };
+}
+function issueInvoice(s: Workspace, id: string, override?: { reason: string }) {
   const inv = s.invoices.find((i) => i.id === id);
   required(inv && inv.status === 'Draft', 'Only draft invoices can be issued.');
+  const check = creditCheck(s, inv.customerId, inv.total);
+  let creditOverride: Invoice['creditOverride'];
+  if (!check.ok) {
+    required(override, check.reasons.join(' '));
+    const reason = String(override.reason || '').trim();
+    required(reason.length >= 5, 'Enter an override reason of at least 5 characters.');
+    // ponytail: anyone can override until roles exist; restrict to managers then
+    creditOverride = {
+      by: CURRENT_USER,
+      at: new Date().toISOString(),
+      reason,
+      reasons: check.reasons,
+    };
+  }
   inv.lines.forEach((l) => activeProduct(s, l.productId));
   const demand: Record<string, number> = {};
   inv.lines.forEach((l) => {
@@ -1456,6 +1506,7 @@ function issueInvoice(s: Workspace, id: string) {
   entries.push({ account: 'cogs', debit: cost }, { account: 'inventory', credit: cost });
   ledger(s, inv.date, inv.number, 'Sale — ' + contact(s, inv.customerId)!.name, entries);
   inv.status = 'Issued';
+  if (creditOverride) inv.creditOverride = creditOverride;
   s.reservations
     .filter((r) => r.source === 'invoice' && r.sourceId === inv.id && r.status === 'Active')
     .forEach((r) => {
@@ -1472,6 +1523,17 @@ function issueInvoice(s: Workspace, id: string) {
     inv.date,
   );
   return inv;
+}
+function customerAccountStatus(s: Workspace, customerId: string) {
+  const c = contact(s, customerId)!,
+    check = creditCheck(s, customerId, 0);
+  return c.onHold
+    ? 'On hold'
+    : check.limit !== null && check.exposure > check.limit
+      ? 'Over limit'
+      : check.overdue > 0
+        ? 'Overdue'
+        : 'OK';
 }
 function payInvoice(
   s: Workspace,
@@ -1670,10 +1732,86 @@ function addExpense(s: Workspace, data: ExpenseInput) {
   activity(s, 'expense', 'Expense recorded', e.description, date);
   return e;
 }
+function accountDays(value: unknown, label: string): number {
+  required(
+    Number.isInteger(value) && Number(value) >= 0 && Number(value) <= 365,
+    `${label} must be a whole number between 0 and 365 days.`,
+  );
+  return Number(value);
+}
+function setAccountSettings(
+  s: Workspace,
+  data: { defaultPaymentTermsDays: NumericInput; overdueGraceDays: NumericInput },
+) {
+  const terms = accountDays(Number(data.defaultPaymentTermsDays), 'Default payment terms');
+  const grace = accountDays(Number(data.overdueGraceDays), 'Overdue grace period');
+  s.settings.defaultPaymentTermsDays = terms;
+  s.settings.overdueGraceDays = grace;
+}
+function accountDefaults(s: Workspace) {
+  return {
+    groupId: '',
+    paymentTermsDays: s.settings.defaultPaymentTermsDays,
+    creditLimit: null,
+    onHold: false,
+    holdReason: '',
+    billing: 'per_delivery' as const,
+  };
+}
+function validateAccount(s: Workspace, c: Contact) {
+  accountDays(c.paymentTermsDays, 'Payment terms');
+  required(
+    c.creditLimit === null || typeof c.creditLimit === 'number',
+    'Enter a valid credit limit.',
+  );
+  if (c.creditLimit !== null) moneyCheck(c.creditLimit, 'Credit limit');
+  required(typeof c.onHold === 'boolean', 'On hold must be a boolean.');
+  required(typeof c.holdReason === 'string', 'Enter a hold reason.');
+  required(!c.onHold || c.holdReason.trim(), 'Enter a hold reason.');
+  required(
+    c.groupId === '' || s.customerGroups.some((g) => g.id === c.groupId),
+    'Select a valid customer group.',
+  );
+  required(['per_delivery', 'monthly'].includes(c.billing), 'Select a valid billing habit.');
+}
+function saveCustomerGroup(
+  s: Workspace,
+  data: { name: string; discountPercent?: number },
+  id?: string,
+) {
+  const previous = s.customerGroups.find((g) => g.id === id);
+  required(!id || previous, 'Customer group not found.');
+  const name = String(data.name || '').trim();
+  required(
+    name.length >= 2 && name.length <= 40,
+    'Group name must be between 2 and 40 characters.',
+  );
+  required(
+    !s.customerGroups.some((g) => g.id !== id && g.name.toLowerCase() === name.toLowerCase()),
+    'Customer group names must be unique.',
+  );
+  const discountPercent = data.discountPercent ?? previous?.discountPercent ?? 0;
+  required(
+    Number.isFinite(discountPercent) && discountPercent >= 0 && discountPercent <= 100,
+    'Discount must be between 0 and 100.',
+  );
+  const group: CustomerGroup = { id: id || uid('grp'), name, discountPercent };
+  if (id) s.customerGroups = s.customerGroups.map((g) => (g.id === id ? group : g));
+  else s.customerGroups.push(group);
+  return group;
+}
+function deleteCustomerGroup(s: Workspace, id: string) {
+  const group = s.customerGroups.find((g) => g.id === id);
+  required(group, 'Customer group not found.');
+  const count = s.contacts.filter((c) => c.type === 'Customer' && c.groupId === id).length;
+  required(count === 0, `${group.name} is used by ${count} customers.`);
+  s.customerGroups = s.customerGroups.filter((g) => g.id !== id);
+}
 function saveContact(s: Workspace, data: ContactInput, id?: string) {
   required(['Customer', 'Supplier'].includes(data.type), 'Select a contact type.');
   required(String(data.name || '').trim().length >= 2, 'Enter a contact name.');
   const c: Contact = {
+    ...accountDefaults(s),
     id: id || uid('contact'),
     type: data.type,
     name: String(data.name).trim(),
@@ -1690,6 +1828,24 @@ function saveContact(s: Workspace, data: ContactInput, id?: string) {
             : null
           : shelfLifeCheck(Number(data.minShelfLifeDays)),
   };
+  if (c.type === 'Customer') {
+    const old = id ? contact(s, id) : undefined;
+    c.groupId = data.groupId ?? old?.groupId ?? '';
+    c.paymentTermsDays =
+      data.paymentTermsDays === undefined
+        ? (old?.paymentTermsDays ?? s.settings.defaultPaymentTermsDays)
+        : accountDays(Number(data.paymentTermsDays), 'Payment terms');
+    c.creditLimit =
+      data.creditLimit === undefined
+        ? (old?.creditLimit ?? null)
+        : data.creditLimit === null || data.creditLimit === ''
+          ? null
+          : moneyCheck(data.creditLimit, 'Credit limit');
+    c.onHold = data.onHold ?? old?.onHold ?? false;
+    c.holdReason = String(data.holdReason ?? old?.holdReason ?? '').trim();
+    c.billing = data.billing ?? old?.billing ?? 'per_delivery';
+    validateAccount(s, c);
+  }
   if (id) {
     const old = contact(s, id);
     required(old, 'Contact not found.');
@@ -1766,6 +1922,7 @@ function emptyWorkspace(s: Workspace): Workspace {
     products: [],
     batches: [],
     contacts: [],
+    customerGroups: [],
     invoices: [],
     purchases: [],
     receipts: [],
@@ -1794,6 +1951,8 @@ function seed(): Workspace {
       taxRate: 0,
       expiryWindow: 90,
       minShelfLifeDays: 0,
+      defaultPaymentTermsDays: 30,
+      overdueGraceDays: 7,
     },
     counters: {
       invoice: 1024,
@@ -1819,6 +1978,7 @@ function seed(): Workspace {
     reservations: [],
     journal: [],
     contacts: [],
+    customerGroups: [],
     warehouses: [
       {
         id: 'wh_main',
@@ -1849,7 +2009,7 @@ function seed(): Workspace {
       },
     ],
   };
-  s.contacts = [
+  [
     {
       id: 'c1',
       minShelfLifeDays: null,
@@ -1940,7 +2100,10 @@ function seed(): Workspace {
       phone: '+855 15 663 818',
       address: 'Khan Chamkar Mon, Phnom Penh',
     },
-  ];
+  ].forEach((data) => {
+    const c = saveContact(s, { ...data, type: data.type as Contact['type'] });
+    c.id = data.id;
+  });
   const specs: [string, string, string, Unit, number, number, number, string, Shape][] = [
     ['Paracetamol 500mg', 'Acetaminophen', 'Pain relief', 'box', 3.2, 5.8, 80, '#74a18c', 'box'],
     [
@@ -2698,6 +2861,37 @@ function seed(): Workspace {
     note: 'Customer cancelled the collection.',
   });
   releaseReservation(s, releasedHold.id);
+  const pharmacy = saveCustomerGroup(s, { name: 'Pharmacy' });
+  const clinic = saveCustomerGroup(s, { name: 'Clinic', discountPercent: 3 });
+  const hospital = saveCustomerGroup(s, { name: 'Hospital', discountPercent: 8 });
+  s.contacts
+    .filter((c) => c.type === 'Customer')
+    .forEach((c) => {
+      saveContact(
+        s,
+        {
+          ...c,
+          groupId: ['c1', 'c4'].includes(c.id)
+            ? pharmacy.id
+            : c.id === 'c5'
+              ? hospital.id
+              : clinic.id,
+          paymentTermsDays: c.id === 'c5' ? 60 : c.id === 'c4' ? 0 : 30,
+          creditLimit: c.id === 'c1' ? 3000 : c.id === 'c4' ? 0 : c.id === 'c5' ? null : 5000,
+          billing: ['c2', 'c5'].includes(c.id) ? 'monthly' : 'per_delivery',
+          onHold: c.id === 'c2',
+          holdReason: c.id === 'c2' ? 'Cheque returned unpaid' : '',
+        },
+        c.id,
+      );
+    });
+  const accountSale = createInvoice(s, {
+    customerId: 'c1',
+    date: today(),
+    lines: [{ productId: 'p16', qty: 48 }],
+    notes: 'Blood pressure monitors for the pharmacy expansion; payment on account.',
+  });
+  issueInvoice(s, accountSale.id);
   return s;
 }
 function migrate(raw: unknown): Workspace {
@@ -2735,10 +2929,18 @@ function migrate(raw: unknown): Workspace {
   if (s.reorderRules === undefined) s.reorderRules = [];
   if (s.reservations === undefined) s.reservations = [];
   if (s.counters.reservation === undefined) s.counters.reservation = 1;
+  if (s.customerGroups === undefined) s.customerGroups = [];
+  if (s.settings) {
+    if (s.settings.defaultPaymentTermsDays === undefined) s.settings.defaultPaymentTermsDays = 30;
+    if (s.settings.overdueGraceDays === undefined) s.settings.overdueGraceDays = 7;
+  }
   if (s.settings?.minShelfLifeDays === undefined && s.settings) s.settings.minShelfLifeDays = 180;
   if (Array.isArray(s.contacts))
     s.contacts.forEach((c) => {
       if (c.minShelfLifeDays === undefined) c.minShelfLifeDays = null;
+      const defaults = accountDefaults(s);
+      for (const key of Object.keys(defaults) as Array<keyof typeof defaults>)
+        if (c[key] === undefined) Object.assign(c, { [key]: defaults[key] });
     });
   if (Array.isArray(s.invoices))
     s.invoices.forEach((i) => {
@@ -2797,6 +2999,7 @@ function validateBackup(value: unknown): Workspace {
     'recalls',
     'reorderRules',
     'reservations',
+    'customerGroups',
   ])
     required(Array.isArray(s[key as keyof Workspace]), 'Backup is missing ' + key + '.');
   required(s.settings && s.counters, 'Backup settings are missing.');
@@ -2813,6 +3016,7 @@ function validateBackup(value: unknown): Workspace {
       'stockCounts',
       'recalls',
       'reservations',
+      'customerGroups',
     ] as const
   ).forEach((key) => {
     ids[key] = new Set();
@@ -2827,6 +3031,25 @@ function validateBackup(value: unknown): Workspace {
       'Backup contains an invalid contact.',
     ),
   );
+  accountDays(s.settings.defaultPaymentTermsDays, 'Default payment terms');
+  accountDays(s.settings.overdueGraceDays, 'Overdue grace period');
+  s.contacts.forEach((c) => validateAccount(s, c));
+  const groupNames = new Set<string>();
+  s.customerGroups.forEach((g) => {
+    required(
+      typeof g.name === 'string' &&
+        g.name === g.name.trim() &&
+        g.name.length >= 2 &&
+        g.name.length <= 40 &&
+        !groupNames.has(g.name.toLowerCase()),
+      'Backup contains invalid or duplicate customer group names.',
+    );
+    groupNames.add(g.name.toLowerCase());
+    required(
+      Number.isFinite(g.discountPercent) && g.discountPercent >= 0 && g.discountPercent <= 100,
+      'Discount must be between 0 and 100.',
+    );
+  });
   const reorderPairs = new Set<string>();
   const reservationNumbers = new Set<string>();
   s.reservations.forEach((r) => {
@@ -3181,6 +3404,22 @@ function validateBackup(value: unknown): Workspace {
     );
     dateCheck(i.date);
     dateCheck(i.due);
+    if (i.creditOverride !== undefined) {
+      const o = i.creditOverride;
+      required(
+        o &&
+          typeof o.by === 'string' &&
+          o.by.trim() &&
+          typeof o.reason === 'string' &&
+          o.reason.trim() &&
+          typeof o.at === 'string' &&
+          /^\d{4}-\d{2}-\d{2}T/.test(o.at) &&
+          !isNaN(new Date(o.at).getTime()) &&
+          Array.isArray(o.reasons) &&
+          o.reasons.every((reason) => typeof reason === 'string'),
+        'Backup contains an invalid credit override.',
+      );
+    }
     moneyCheck(i.total);
     moneyCheck(i.paid);
     required(i.paid <= i.total && i.paid >= 0, 'Invalid invoice payment balance.');
@@ -3378,6 +3617,11 @@ export const A = {
   cancelPurchase,
   addExpense,
   saveContact,
+  saveCustomerGroup,
+  deleteCustomerGroup,
+  creditCheck,
+  customerAccountStatus,
+  setAccountSettings,
   balances,
   transact,
   persist,

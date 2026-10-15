@@ -670,6 +670,14 @@ export function TransactionForm({
     invoice?.customerId || (initial && 'customerId' in initial ? initial.customerId : ''),
   );
   const [allowShortDated, setAllowShortDated] = useState(invoice?.allowShortDated || false);
+  const [invoiceDate, setInvoiceDate] = useState(invoice?.date || A.today());
+  const defaultDue = (date: string, customer: string) =>
+    A.shift(
+      A.contact(state, customer)?.paymentTermsDays ?? state.settings.defaultPaymentTermsDays,
+      date,
+    );
+  const [due, setDue] = useState(invoice?.due || defaultDue(invoiceDate, customerId));
+  const [attemptedIssue, setAttemptedIssue] = useState(false);
   const saleOptions = { customerId, allowShortDated, exceptSourceId: invoice?.id };
   const shortLots = purchase ? [] : A.shortDatedBatches(state, lines, saleOptions);
   const coldOnly = purchase && lines.some((l) => A.product(state, l.productId)?.storage === 'cold');
@@ -677,6 +685,11 @@ export function TransactionForm({
   const discountValue = purchase ? 0 : Number(discount) || 0,
     taxValue = purchase ? 0 : Number(taxRate) || 0;
   const tax = A.round((Math.max(0, subtotal - discountValue) * taxValue) / 100);
+  const saleTotal = Math.max(0, subtotal - discountValue + tax);
+  const credit =
+    !purchase && customerId && Number.isFinite(saleTotal) && saleTotal <= 100000000
+      ? A.creditCheck(state, customerId, saleTotal)
+      : undefined;
   function update(key: string, field: 'productId' | 'unit' | 'qty' | 'price', value: string) {
     setLines((current) =>
       current.map((line) => {
@@ -737,6 +750,8 @@ export function TransactionForm({
   return (
     <WorkspaceForm
       onSubmit={(data, mode) => {
+        const issuing = mode === 'issue' || mode === 'override';
+        if (!purchase && issuing) setAttemptedIssue(true);
         const items: LineInput[] = lines.map((line) => ({
           productId: line.productId,
           unit: line.unit,
@@ -775,10 +790,15 @@ export function TransactionForm({
                 },
                 id,
               );
-              if (mode === 'issue') A.issueInvoice(s, i.id);
+              if (issuing)
+                A.issueInvoice(
+                  s,
+                  i.id,
+                  mode === 'override' ? { reason: data.overrideReason } : undefined,
+                );
               return i;
             },
-            mode === 'issue' ? 'Invoice issued. Stock and accounts updated.' : 'Draft saved.',
+            issuing ? 'Invoice issued. Stock and accounts updated.' : 'Draft saved.',
             (i) => open('invoice-detail', i.id),
           );
       }}
@@ -831,7 +851,11 @@ export function TransactionForm({
               label="Customer"
               name="customerId"
               defaultValue={customerId}
-              onChange={setCustomerId}
+              onChange={(value) => {
+                setCustomerId(value);
+                setDue(defaultDue(invoiceDate, value));
+                setAttemptedIssue(false);
+              }}
               full
             >
               <ContactOptions type="Customer" />
@@ -840,7 +864,11 @@ export function TransactionForm({
               label="Invoice date"
               name="date"
               type="date"
-              defaultValue={invoice?.date || A.today()}
+              value={invoiceDate}
+              onChange={(event) => {
+                setInvoiceDate(event.target.value);
+                if (event.target.value) setDue(defaultDue(event.target.value, customerId));
+              }}
               max={A.today()}
               required
             />
@@ -848,7 +876,8 @@ export function TransactionForm({
               label="Due date"
               name="due"
               type="date"
-              defaultValue={invoice?.due || A.shift(30)}
+              value={due}
+              onChange={(event) => setDue(event.target.value)}
               required
             />
           </>
@@ -1067,9 +1096,139 @@ export function TransactionForm({
               Issue invoice
             </button>
           </div>
+          {attemptedIssue && credit && !credit.ok && (
+            <CreditOverrideFields reasons={credit.reasons} />
+          )}
         </>
       )}
     </WorkspaceForm>
+  );
+}
+function CreditOverrideFields({ reasons }: { reasons: string[] }) {
+  return (
+    <>
+      <Callout>
+        <ul>
+          {reasons.map((reason) => (
+            <li key={reason}>{reason}</li>
+          ))}
+        </ul>
+      </Callout>
+      <Field label="Override reason" name="overrideReason" minLength={5} />
+      <div className="form-footer">
+        <button type="submit" className="btn primary" value="override">
+          Override and issue
+        </button>
+      </div>
+    </>
+  );
+}
+export function InvoiceIssueForm({ id }: { id: string }) {
+  const { state, mutate, open } = useWorkspace();
+  const [attempted, setAttempted] = useState(false);
+  const invoice = state.invoices.find((i) => i.id === id)!;
+  const credit = A.creditCheck(state, invoice.customerId, invoice.total);
+  return (
+    <WorkspaceForm
+      onSubmit={(data, mode) => {
+        setAttempted(true);
+        mutate(
+          (s) =>
+            A.issueInvoice(
+              s,
+              id,
+              mode === 'override' ? { reason: data.overrideReason } : undefined,
+            ),
+          'Invoice issued. Stock and accounts updated.',
+          () => open('invoice-detail', id),
+        );
+      }}
+    >
+      <Button type="submit" icon="check">
+        Issue invoice
+      </Button>
+      {attempted && !credit.ok && <CreditOverrideFields reasons={credit.reasons} />}
+    </WorkspaceForm>
+  );
+}
+export function ContactHoldForm({ id }: { id: string }) {
+  const { state, mutate, open } = useWorkspace();
+  const c = A.contact(state, id)!;
+  return (
+    <WorkspaceForm
+      onSubmit={(data) =>
+        mutate(
+          (s) =>
+            A.saveContact(
+              s,
+              { ...c, onHold: !c.onHold, holdReason: c.onHold ? '' : data.holdReason },
+              id,
+            ),
+          c.onHold ? 'Hold released.' : 'Customer put on hold.',
+          () => open('contact-detail', id),
+        )
+      }
+    >
+      {c.onHold ? (
+        <Callout>{c.holdReason}</Callout>
+      ) : (
+        <Field label="Hold reason" name="holdReason" required />
+      )}
+      <FormFooter label={c.onHold ? 'Release hold' : 'Put on hold'} />
+    </WorkspaceForm>
+  );
+}
+export function CustomerGroups() {
+  const { state, mutate } = useWorkspace();
+  return (
+    <div className="panel-body">
+      <h3 className="detail-label">Customer groups</h3>
+      {state.customerGroups.map((g) => (
+        <WorkspaceForm
+          key={g.id}
+          className="mb-[20px]"
+          onSubmit={(data, mode) => {
+            mutate(
+              (s) =>
+                mode === 'delete'
+                  ? A.deleteCustomerGroup(s, g.id)
+                  : A.saveCustomerGroup(s, { name: data[`group-${g.id}`] }, g.id),
+              mode === 'delete' ? 'Customer group deleted.' : 'Customer group saved.',
+              undefined,
+              true,
+            );
+          }}
+        >
+          <div className="flex items-end gap-[10px] flex-wrap">
+            <Field label={`Group name (${g.name})`} name={`group-${g.id}`} defaultValue={g.name} />
+            <Button type="submit" tone="">
+              Rename
+            </Button>
+            <button type="submit" className="btn danger" value="delete">
+              Delete
+            </button>
+          </div>
+        </WorkspaceForm>
+      ))}
+      <WorkspaceForm
+        key={state.customerGroups.length}
+        onSubmit={(data) =>
+          mutate(
+            (s) => A.saveCustomerGroup(s, { name: data.newGroupName }),
+            'Customer group added.',
+            undefined,
+            true,
+          )
+        }
+      >
+        <Field label="New group name" name="newGroupName" minLength={2} maxLength={40} required />
+        <div className="form-footer">
+          <Button type="submit" icon="plus">
+            Add group
+          </Button>
+        </div>
+      </WorkspaceForm>
+    </div>
   );
 }
 export function PaymentForm({ id, bill = false }: { id: string; bill?: boolean }) {
@@ -1240,6 +1399,7 @@ export function ContactForm({ id }: { id?: string }) {
   const { state, mutate } = useWorkspace();
   const c = id ? A.contact(state, id) : undefined;
   const [type, setType] = useState<ContactType>(c?.type || 'Customer');
+  const [onHold, setOnHold] = useState(c?.onHold || false);
   return (
     <WorkspaceForm
       onSubmit={(data) =>
@@ -1255,6 +1415,12 @@ export function ContactForm({ id }: { id?: string }) {
                 email: data.email,
                 address: data.address,
                 minShelfLifeDays: data.minShelfLifeDays || null,
+                groupId: data.groupId || '',
+                paymentTermsDays: data.paymentTermsDays,
+                creditLimit: data.creditLimit || null,
+                billing: data.billing as 'per_delivery' | 'monthly',
+                onHold,
+                holdReason: data.holdReason || '',
               },
               id,
             ),
@@ -1292,6 +1458,63 @@ export function ContactForm({ id }: { id?: string }) {
           />
         )}
       </div>
+      {type === 'Customer' && (
+        <>
+          <div className="form-section">Account</div>
+          <div className="form-grid">
+            <SelectField
+              label="Customer group"
+              name="groupId"
+              defaultValue={c?.groupId || ''}
+              required={false}
+            >
+              <option value="">No group</option>
+              {state.customerGroups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </SelectField>
+            <Field
+              label="Payment terms (days)"
+              name="paymentTermsDays"
+              type="number"
+              defaultValue={c?.paymentTermsDays ?? state.settings.defaultPaymentTermsDays}
+              min="0"
+              max="365"
+              step="1"
+              required
+            />
+            <Field
+              label="Credit limit ($, empty = no limit)"
+              name="creditLimit"
+              type="number"
+              defaultValue={c?.creditLimit ?? ''}
+              min="0"
+              step="0.01"
+            />
+            <SelectField
+              label="Billing habit"
+              name="billing"
+              defaultValue={c?.billing || 'per_delivery'}
+            >
+              <option value="per_delivery">Invoice each delivery</option>
+              <option value="monthly">Monthly billing</option>
+            </SelectField>
+            <label className="flex items-center gap-[8px]">
+              <input
+                type="checkbox"
+                checked={onHold}
+                onChange={(event) => setOnHold(event.target.checked)}
+              />
+              On hold
+            </label>
+            {onHold && (
+              <Field label="Hold reason" name="holdReason" defaultValue={c?.holdReason} required />
+            )}
+          </div>
+        </>
+      )}
       <FormFooter label="Save contact" />
     </WorkspaceForm>
   );

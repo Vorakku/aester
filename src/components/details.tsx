@@ -12,7 +12,7 @@ import {
   StockQuantity,
   Summary,
 } from './ui';
-import { InvoiceDocument } from './forms';
+import { InvoiceDocument, InvoiceIssueForm } from './forms';
 import { ReorderLevels } from './reorder';
 import { ReservationsList } from './reservations';
 
@@ -305,22 +305,7 @@ export function InvoiceDetail({ id }: { id: string }) {
             <Button tone="" icon="edit" onClick={() => open('invoice-form', id)}>
               Edit draft
             </Button>
-            <Button
-              icon="check"
-              onClick={() => {
-                try {
-                  mutate(
-                    (s) => A.issueInvoice(s, id),
-                    'Invoice issued. Stock and accounts updated.',
-                    () => open('invoice-detail', id),
-                  );
-                } catch (error) {
-                  toast(errorMessage(error), true);
-                }
-              }}
-            >
-              Issue invoice
-            </Button>
+            <InvoiceIssueForm id={id} />
           </>
         ) : A.invoiceBalance(i) > 0 ? (
           <Button icon="wallet" onClick={() => open('invoice-payment', id)}>
@@ -347,6 +332,16 @@ export function InvoiceDetail({ id }: { id: string }) {
             Delete draft
           </Button>
         </div>
+      )}
+      {i.creditOverride && (
+        <Callout>
+          Credit override by {i.creditOverride.by}: {i.creditOverride.reason}
+          <ul>
+            {i.creditOverride.reasons.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </Callout>
       )}
       {i.payments.length > 0 && (
         <>
@@ -496,6 +491,31 @@ export function ContactDetail({ id }: { id: string }) {
         ]}
       />
       {customer && <ReservationsList customerId={id} />}
+      {customer && (
+        <>
+          <h3 className="detail-label">Account</h3>
+          <Summary
+            items={[
+              ['Group', state.customerGroups.find((g) => g.id === c.groupId)?.name || 'No group'],
+              ['Payment terms', `${c.paymentTermsDays} days`],
+              ['Credit limit', c.creditLimit === null ? 'No limit' : money(c.creditLimit)],
+              ['Current exposure', money(A.creditCheck(state, id, 0).exposure)],
+              ['Overdue amount', money(A.creditCheck(state, id, 0).overdue)],
+              [
+                'Billing habit',
+                c.billing === 'monthly' ? 'Monthly billing' : 'Invoice each delivery',
+              ],
+              ['Status', <Badge status={A.customerAccountStatus(state, id)} />],
+            ]}
+          />
+          {c.onHold && <Callout>{c.holdReason}</Callout>}
+          <div className="detail-actions">
+            <Button tone="" onClick={() => open('contact-hold', id)}>
+              {c.onHold ? 'Release hold' : 'Put on hold'}
+            </Button>
+          </div>
+        </>
+      )}
       <h3 className="detail-label">{customer ? 'Invoice' : 'Purchase order'} history</h3>
       {items.slice(0, 10).map((item) => (
         <button
