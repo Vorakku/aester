@@ -202,6 +202,7 @@ export function Badge({ status }: { status: string }) {
     'Confirmed',
     'Done',
     'Delivered',
+    'Approved',
   ].includes(status)
     ? ''
     : [
@@ -209,13 +210,15 @@ export function Badge({ status }: { status: string }) {
           'Expiring soon',
           'Short-dated',
           'Partial',
-          'Ordered',
+          'Needs approval',
           'Unpaid',
           'Due',
           'Open',
           'No reg.',
           'Backorder',
           'Partly delivered',
+          'Partly received',
+          'Partly paid',
         ].includes(status)
       ? 'amber'
       : [
@@ -249,6 +252,7 @@ export function Badge({ status }: { status: string }) {
               'Monthly',
               'Per delivery',
               'Not delivered',
+              'Sent',
             ].includes(status)
           ? 'blue'
           : status === 'CD'
@@ -524,8 +528,14 @@ export function Field({
   label,
   name,
   full = false,
+  hint,
   ...props
-}: InputHTMLAttributes<HTMLInputElement> & { label: string; name: string; full?: boolean }) {
+}: InputHTMLAttributes<HTMLInputElement> & {
+  label: string;
+  name: string;
+  full?: boolean;
+  hint?: string;
+}) {
   return (
     <div className={`form-field ${full ? 'full' : ''}`}>
       <label htmlFor={`f-${name}`}>
@@ -533,6 +543,7 @@ export function Field({
         {props.required && <span className="text-[#afc69e]"> *</span>}
       </label>
       <input id={`f-${name}`} name={name} {...props} />
+      {hint && <small className="muted text-[9px] block mt-[5px]">{hint}</small>}
     </div>
   );
 }

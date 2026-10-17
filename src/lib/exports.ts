@@ -152,11 +152,44 @@ export function exportStockLedger(state: Workspace, moves: StockMove[] = A.moves
   );
 }
 
+export function exportReceipts(state: Workspace) {
+  csv(
+    `aster-receipts-${A.today()}.csv`,
+    [
+      'GRN',
+      'Date',
+      'Supplier',
+      'PO Number',
+      'Reference',
+      'Total USD',
+      'Paid USD',
+      'Credited USD',
+      'Balance USD',
+      'Due Date',
+      'Status',
+    ],
+    state.receipts.map((r) => [
+      r.number,
+      r.date,
+      A.contact(state, r.supplierId)?.name || '—',
+      r.purchaseId ? state.purchases.find((p) => p.id === r.purchaseId)?.number || '' : '',
+      r.reference || '',
+      r.total,
+      r.paid,
+      r.credited,
+      A.billBalance(r),
+      r.due,
+      A.billStatus(r),
+    ]),
+  );
+}
+
 export type ExportType =
   | 'products'
   | 'batches'
   | 'invoices'
   | 'purchases'
+  | 'receipts'
   | 'contacts'
   | 'ledger'
   | 'overview'
@@ -254,16 +287,7 @@ export function exportData(state: Workspace, type: ExportType, period: number) {
   if (type === 'purchases')
     csv(
       name,
-      [
-        'Purchase order',
-        'Supplier',
-        'Warehouse',
-        'Date',
-        'Expected',
-        'Total USD',
-        'Paid USD',
-        'Status',
-      ],
+      ['Purchase order', 'Supplier', 'Warehouse', 'Date', 'Expected', 'Total USD', 'Status'],
       state.purchases.map((p) => [
         p.number,
         A.contact(state, p.supplierId)?.name,
@@ -271,10 +295,10 @@ export function exportData(state: Workspace, type: ExportType, period: number) {
         p.date,
         p.expected,
         p.total,
-        p.paid,
-        p.status,
+        A.purchaseStatus(state, p),
       ]),
     );
+  if (type === 'receipts') exportReceipts(state);
   if (type === 'contacts')
     csv(
       name,

@@ -1,20 +1,23 @@
+import { useState } from 'react';
 import { CustomerCreditActions, PaymentsTable, InvoicePayments } from './payments';
 import { CreditNotesTable } from './creditNotes';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { A } from '../lib/model';
-import { date, initials, money, number, errorMessage } from '../lib/format';
+import { date, shortDate, initials, money, number, errorMessage } from '../lib/format';
 import {
   Badge,
   Button,
   Callout,
   DataTable,
   Empty,
+  Field,
   ProductArt,
   ProductBadges,
   StockQuantity,
   Summary,
 } from './ui';
-import { InvoiceDocument, InvoiceIssueForm } from './forms';
+import { InvoiceDocument, InvoiceIssueForm, WorkspaceForm } from './forms';
+import type { Purchase } from '../types';
 import { ReorderLevels } from './reorder';
 import { ReservationsList } from './reservations';
 import { SpecialPrices } from '../pages/Pricing';
@@ -412,13 +415,139 @@ export function InvoiceDetail({ id }: { id: string }) {
     </>
   );
 }
+export function PurchaseOrderDocument({ order }: { order: Purchase }) {
+  const { state } = useWorkspace();
+  const s = state.settings;
+  const supplier = A.contact(state, order.supplierId);
+  const warehouse = A.warehouse(state, order.warehouseId);
+  return (
+    <div className="invoice-document mt-[24px]" id="print-document">
+      <div className="invoice-document-header">
+        <div>
+          <div className="invoice-brand">
+            aster<span className="text-[#adc298] text-[15px] ml-[3px]">✳</span>
+            <small>{s.company}</small>
+          </div>
+          <p className="mt-[12px]">{s.address}</p>
+          <p>{s.email}</p>
+          <p>{s.phone}</p>
+        </div>
+        <div>
+          <h3>PURCHASE ORDER</h3>
+          <p>{order.number}</p>
+          <p>{date(order.date)}</p>
+          <div className="mt-[9px]">
+            <span className="badge">{order.status}</span>
+          </div>
+        </div>
+      </div>
+      <div className="invoice-document-parties">
+        <div>
+          <span>Supplier</span>
+          <strong>{supplier?.name}</strong>
+          {supplier?.address && (
+            <>
+              {supplier.address}
+              <br />
+            </>
+          )}
+          {supplier?.phone && (
+            <>
+              {supplier.phone}
+              <br />
+            </>
+          )}
+          {supplier?.email && <>{supplier.email}</>}
+        </div>
+        <div className="text-right">
+          <span>Deliver to</span>
+          <strong>{warehouse?.name}</strong>
+          {warehouse?.address && <p>{warehouse.address}</p>}
+          <p className="mt-[6px]">
+            <span>Expected delivery: </span>
+            <strong>{date(order.expected)}</strong>
+          </p>
+        </div>
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Product</th>
+              <th>SKU</th>
+              <th>Qty</th>
+              <th>Unit cost</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {order.lines.map((line, index) => (
+              <tr key={index}>
+                <td className="whitespace-normal">
+                  <strong>{line.name}</strong>
+                </td>
+                <td className="mono text-[9px]">{line.sku}</td>
+                <td>
+                  {number(line.qty)} {A.unitLabel(line.unit, line.qty)}
+                </td>
+                <td>{money(line.price)}</td>
+                <td>{money(line.qty * line.price)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="invoice-summary">
+        <div className="invoice-total">
+          <span>Order total</span>
+          <span>{money(order.total)}</span>
+        </div>
+      </div>
+      {order.notes && <div className="invoice-note">{order.notes}</div>}
+      {order.approval && (
+        <div className="invoice-note mt-[12px]">
+          Approved by {order.approval.by} on {date(order.approval.at)}
+          {order.approval.note ? ` · ${order.approval.note}` : ''}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function PurchaseDetail({ id }: { id: string }) {
   const { state, open, mutate, confirm } = useWorkspace();
+  const [approving, setApproving] = useState(false);
+  const [canceling, setCanceling] = useState(false);
   const p = state.purchases.find((p) => p.id === id);
   if (!p) return <Empty />;
+  const canApprove =
+    p.status === 'Draft' &&
+    state.settings.poApprovalLimit > 0 &&
+    p.total > state.settings.poApprovalLimit;
+
+  const receipts = state.receipts.filter((r) => r.purchaseId === p.id);
+  const totalBilled = A.round(A.sum(receipts, (r) => r.total));
+  const orderedReceivedValue = A.round(
+    A.sum(
+      receipts.flatMap((r) => r.lines),
+      (l) => l.qty * (l.orderedPrice ?? l.price),
+    ),
+  );
+
   return (
     <>
-      <Badge status={p.status} />
+      <div className="flex items-center gap-[8px]">
+        <Badge status={A.purchaseStatus(state, p)} />
+        {A.approvalRequired(state, p) && <Badge status="Needs approval" />}
+      </div>
+      {p.approval && (
+        <Callout>
+          Approved by {p.approval.by} on {shortDate(p.approval.at)}
+          {p.approval.note ? ` · ${p.approval.note}` : ''}
+        </Callout>
+      )}
+      {p.closeReason && <Callout>Closed short: {p.closeReason}</Callout>}
+      {p.cancelReason && <Callout>Cancellation: {p.cancelReason}</Callout>}
       <div className="my-[18px]">
         <Summary
           items={[
@@ -426,6 +555,7 @@ export function PurchaseDetail({ id }: { id: string }) {
             ['Warehouse', A.warehouse(state, p.warehouseId)?.name],
             ['Order date', date(p.date)],
             ['Expected delivery', date(p.expected)],
+            ...(p.sentAt ? [['Sent', date(p.sentAt)] as [string, string]] : []),
             ...(p.received ? [['Received', date(p.received)] as [string, string]] : []),
           ]}
         />
@@ -435,24 +565,35 @@ export function PurchaseDetail({ id }: { id: string }) {
           <thead>
             <tr>
               <th>Product</th>
-              <th>Qty</th>
+              <th>Ordered</th>
+              <th>Received</th>
+              <th>Closed</th>
+              <th>Open</th>
               <th>Cost</th>
               <th>Total</th>
             </tr>
           </thead>
           <tbody>
-            {p.lines.map((l, index) => (
-              <tr key={index}>
-                <td>
-                  <strong>{l.name}</strong>
-                </td>
-                <td>
-                  {number(l.qty)} {A.unitLabel(l.unit, l.qty)}
-                </td>
-                <td>{money(l.price)}</td>
-                <td>{money(l.qty * l.price)}</td>
-              </tr>
-            ))}
+            {p.lines.map((l, index) => {
+              const rec = A.receivedQty(state, p, l.id);
+              const closed = l.closedQty || 0;
+              const open = A.openQty(state, p, l);
+              return (
+                <tr key={l.id || index}>
+                  <td>
+                    <strong>{l.name}</strong>
+                  </td>
+                  <td>
+                    {number(l.qty)} {A.unitLabel(l.unit, l.qty)}
+                  </td>
+                  <td>{number(rec)}</td>
+                  <td>{number(closed)}</td>
+                  <td>{number(open)}</td>
+                  <td>{money(l.price)}</td>
+                  <td>{money(l.qty * l.price)}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -460,16 +601,88 @@ export function PurchaseDetail({ id }: { id: string }) {
         <Summary
           items={[
             ['Order total', money(p.total)],
-            ...(p.status === 'Received'
-              ? [['Supplier balance', money(p.total - p.paid)] as [string, string]]
+            ...(receipts.length > 0
+              ? [
+                  ['Billed total', money(totalBilled)] as [string, string],
+                  ['Outstanding payables', money(A.sum(receipts, A.billBalance))] as [
+                    string,
+                    string,
+                  ],
+                ]
               : []),
           ]}
         />
       </div>
+      {receipts.length > 0 && totalBilled !== orderedReceivedValue && (
+        <Callout>
+          Billed {money(totalBilled)} vs ordered {money(orderedReceivedValue)}
+        </Callout>
+      )}
+      {receipts.length > 0 && (
+        <div className="mt-[18px]">
+          <h4 className="detail-label">Receipts</h4>
+          <div className="table-wrap mt-[8px]">
+            <table>
+              <thead>
+                <tr>
+                  <th>GRN</th>
+                  <th>Date</th>
+                  <th>Reference</th>
+                  <th>Total</th>
+                  <th>Balance</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {receipts.map((r) => (
+                  <tr key={r.id}>
+                    <td>
+                      <button
+                        className="table-link mono"
+                        onClick={() => open('receipt-detail', r.id)}
+                      >
+                        {r.number}
+                      </button>
+                    </td>
+                    <td>{shortDate(r.date)}</td>
+                    <td>{r.reference || '—'}</td>
+                    <td>{money(r.total)}</td>
+                    <td>{money(A.billBalance(r))}</td>
+                    <td>
+                      <Badge status={A.billStatus(r)} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
       {p.notes && <Callout>{p.notes}</Callout>}
       <div className="detail-actions">
-        {p.status === 'Ordered' ? (
+        {p.status === 'Draft' ? (
           <>
+            <Button tone="" icon="edit" onClick={() => open('purchase-form', id)}>
+              Edit
+            </Button>
+            {canApprove && (
+              <Button icon="check" onClick={() => setApproving(true)}>
+                Approve
+              </Button>
+            )}
+            <Button
+              disabled={A.approvalRequired(state, p)}
+              title={
+                A.approvalRequired(state, p)
+                  ? `Purchase orders over ${money(state.settings.poApprovalLimit)} need approval before sending.`
+                  : undefined
+              }
+              onClick={() =>
+                mutate((s) => A.sendPurchase(s, id), 'Purchase order sent.', undefined, true)
+              }
+            >
+              Send
+            </Button>
             <Button
               tone="danger"
               icon="close"
@@ -477,24 +690,211 @@ export function PurchaseDetail({ id }: { id: string }) {
                 confirm(
                   'Cancel this purchase order?',
                   'The unreceived order remains in your history with a canceled status.',
-                  () => mutate((s) => A.cancelPurchase(s, id), 'Purchase order canceled.'),
+                  () =>
+                    mutate(
+                      (s) => A.cancelPurchase(s, id),
+                      'Purchase order canceled.',
+                      undefined,
+                      true,
+                    ),
                   'Cancel order',
                 )
               }
             >
               Cancel order
             </Button>
-            <Button icon="receive" onClick={() => open('purchase-receive', id)}>
-              Receive order
+          </>
+        ) : p.status === 'Sent' ? (
+          <>
+            <Button tone="" icon="edit" onClick={() => open('purchase-form', id)}>
+              Edit
             </Button>
+            <Button tone="" icon="print" onClick={() => window.print()}>
+              Print / PDF
+            </Button>
+            <Button icon="receive" onClick={() => open('purchase-receive', id)}>
+              Receive
+            </Button>
+            {receipts.length > 0 && (
+              <Button tone="" onClick={() => open('close-remainder', id)}>
+                Close remainder
+              </Button>
+            )}
+            {!receipts.length && (
+              <Button tone="danger" icon="close" onClick={() => setCanceling(true)}>
+                Cancel order
+              </Button>
+            )}
           </>
         ) : (
-          p.status === 'Received' &&
-          p.paid < p.total && (
-            <Button icon="wallet" onClick={() => open('bill-payment', id)}>
-              Pay supplier
+          p.status === 'Received' && (
+            <Button tone="" icon="print" onClick={() => window.print()}>
+              Print / PDF
             </Button>
           )
+        )}
+      </div>
+      {approving && (
+        <WorkspaceForm
+          onSubmit={(data) => {
+            mutate(
+              (s) => A.approvePurchase(s, id, data.note),
+              'Purchase order approved.',
+              undefined,
+              true,
+            );
+            setApproving(false);
+          }}
+        >
+          <Field label="Approval note (optional)" name="note" />
+          <div className="form-footer">
+            <Button tone="" onClick={() => setApproving(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" icon="check">
+              Confirm approval
+            </Button>
+          </div>
+        </WorkspaceForm>
+      )}
+      {canceling && (
+        <WorkspaceForm
+          onSubmit={(data) => {
+            mutate(
+              (s) => A.cancelPurchase(s, id, data.reason),
+              'Purchase order canceled.',
+              undefined,
+              true,
+            );
+            setCanceling(false);
+          }}
+        >
+          <Field label="Cancellation reason" name="reason" required />
+          <div className="form-footer">
+            <Button tone="" onClick={() => setCanceling(false)}>
+              Keep order
+            </Button>
+            <Button type="submit" icon="check">
+              Confirm cancellation
+            </Button>
+          </div>
+        </WorkspaceForm>
+      )}
+      <PurchaseOrderDocument order={p} />
+    </>
+  );
+}
+
+export function ReceiptDetail({ id }: { id: string }) {
+  const { state, open } = useWorkspace();
+  const r = state.receipts.find((rec) => rec.id === id);
+  if (!r) return <Empty />;
+  const supplier = A.contact(state, r.supplierId);
+  const po = r.purchaseId ? state.purchases.find((p) => p.id === r.purchaseId) : undefined;
+  const balance = A.billBalance(r);
+  const status = A.billStatus(r);
+
+  return (
+    <>
+      <div className="flex items-center gap-[8px]">
+        <Badge status={status} />
+      </div>
+      <div className="my-[18px]">
+        <Summary
+          items={[
+            ['GRN number', r.number],
+            ['Supplier', supplier?.name || r.supplierId],
+            ...(po
+              ? [
+                  [
+                    'Purchase order',
+                    <button
+                      type="button"
+                      key="po-link"
+                      className="table-link mono"
+                      onClick={() => open('purchase-detail', po.id)}
+                    >
+                      {po.number}
+                    </button>,
+                  ] as [string, any],
+                ]
+              : []),
+            ['Supplier reference', r.reference || '—'],
+            ['Receipt date', date(r.date)],
+            ['Due date', date(r.due)],
+            ['Warehouse', A.warehouse(state, r.warehouseId)?.name || '—'],
+          ]}
+        />
+      </div>
+      {r.lines.length > 0 && (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Product</th>
+                <th>Lot / Batch</th>
+                <th>Expiry</th>
+                <th>Qty</th>
+                <th>Cost</th>
+                {po && <th>PO Cost</th>}
+                {po && <th>Diff</th>}
+                <th>Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {r.lines.map((l, index) => {
+                const poCost = l.orderedPrice;
+                const diff = poCost !== undefined ? A.round(l.price - poCost) : undefined;
+                return (
+                  <tr key={index}>
+                    <td>
+                      <strong>{l.name}</strong>
+                    </td>
+                    <td>{l.lotCode || '—'}</td>
+                    <td>{l.expiry ? shortDate(l.expiry) : '—'}</td>
+                    <td>
+                      {number(l.qty)} {A.unitLabel(l.unit, l.qty)}
+                    </td>
+                    <td>{money(l.price)}</td>
+                    {po && <td>{poCost !== undefined ? money(poCost) : '—'}</td>}
+                    {po && (
+                      <td>
+                        {diff !== undefined && diff !== 0 ? (
+                          <span className={diff > 0 ? 'text-amber-600' : 'text-green-600'}>
+                            {diff > 0 ? `+${money(diff)}` : `-${money(Math.abs(diff))}`}
+                          </span>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                    )}
+                    <td>{money(l.qty * l.price)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div className="mt-[18px]">
+        <Summary
+          items={[
+            ['Total', money(r.total)],
+            ['Paid', money(r.paid)],
+            ['Credited', money(r.credited)],
+            ['Balance', money(balance)],
+          ]}
+        />
+      </div>
+      {r.notes && <Callout>{r.notes}</Callout>}
+      <div className="detail-actions">
+        <Button tone="" icon="print" onClick={() => window.print()}>
+          Print GRN
+        </Button>
+        {balance > 0 && (
+          <Button icon="wallet" onClick={() => open('bill-payment', r.id)}>
+            Pay supplier
+          </Button>
         )}
       </div>
     </>
@@ -565,6 +965,60 @@ export function ContactDetail({ id }: { id: string }) {
           </div>
         </>
       )}
+      {!customer && (
+        <>
+          <h3 className="detail-label">Account</h3>
+          <Summary
+            items={[
+              [
+                'Payment terms',
+                c.paymentTermsDays === 0 ? 'Cash on delivery' : `${c.paymentTermsDays} days`,
+              ],
+              ['Lead time', `${c.leadTimeDays} ${c.leadTimeDays === 1 ? 'day' : 'days'}`],
+              ['Minimum order', c.minOrderValue === null ? 'None' : money(c.minOrderValue)],
+              [
+                'Outstanding payables',
+                money(
+                  A.sum(
+                    state.receipts.filter((r) => r.supplierId === id),
+                    A.billBalance,
+                  ),
+                ),
+              ],
+            ]}
+          />
+          <h3 className="detail-label">Supplier bills</h3>
+          {state.receipts
+            .filter((r) => r.supplierId === id)
+            .slice(0, 10)
+            .map((bill) => (
+              <button
+                className="detail-batch w-full text-left"
+                key={bill.id}
+                onClick={() => open('receipt-detail', bill.id)}
+              >
+                <div>
+                  <strong>{bill.number}</strong>
+                  <small>
+                    {date(bill.date)}
+                    {bill.reference ? ` · ${bill.reference}` : ''}
+                  </small>
+                </div>
+                <div className="text-right">
+                  <strong>{money(bill.total)}</strong>
+                  <br />
+                  <Badge status={A.billStatus(bill)} />
+                </div>
+              </button>
+            ))}
+          {!state.receipts.some((r) => r.supplierId === id) && (
+            <Empty
+              title="No supplier bills yet"
+              description="Goods receipts and bills will appear here."
+            />
+          )}
+        </>
+      )}
       <h3 className="detail-label">{customer ? 'Invoice' : 'Purchase order'} history</h3>
       {customer && <CustomerOrders customerId={id} />}
       {customer && (
@@ -586,7 +1040,11 @@ export function ContactDetail({ id }: { id: string }) {
           <div className="text-right">
             <strong>{money(item.total)}</strong>
             <br />
-            <Badge status={'due' in item ? A.invoiceStatus(item) : item.status} />
+            <Badge
+              status={
+                'due' in item ? A.invoiceStatus(item) : A.purchaseStatus(state, item as Purchase)
+              }
+            />
           </div>
         </button>
       ))}

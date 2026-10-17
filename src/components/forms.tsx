@@ -1,12 +1,13 @@
 import { useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { A } from '../lib/model';
-import { errorMessage, money, number } from '../lib/format';
+import { errorMessage, money, number, shortDate } from '../lib/format';
 import {
   Button,
   Badge,
   Callout,
   ContactOptions,
+  Empty,
   Field,
   FormFooter,
   Icon,
@@ -343,6 +344,7 @@ export function ReceiveForm({ id }: { id?: string }) {
               warehouseId: data.warehouseId,
               supplierId: data.supplierId,
               payment: data.payment,
+              reference: data.reference,
             }),
           'Stock received. Inventory and accounts updated.',
         )
@@ -428,6 +430,12 @@ export function ReceiveForm({ id }: { id?: string }) {
         >
           <ContactOptions type="Supplier" />
         </SelectField>
+        <Field
+          label="Supplier invoice / delivery note no."
+          name="reference"
+          placeholder="e.g. INV-10492"
+          full
+        />
         <SelectField label="Payment source" name="payment" defaultValue="credit" full>
           <option value="credit">Supplier credit — accounts payable</option>
           <option value="cash">Paid from cash & bank</option>
@@ -662,9 +670,11 @@ export function TransactionForm({
   const { state, mutate, open, close, toast } = useWorkspace();
   const invoice = id ? state.invoices.find((i) => i.id === id) : undefined;
   const salesOrder = order && id ? state.orders.find((o) => o.id === id) : undefined;
+  const purchaseOrder = purchase && id ? state.purchases.find((p) => p.id === id) : undefined;
   const quotation = salesOrder ? salesOrder.status === 'Quote' : asQuote;
   const [lines, setLines] = useState<EditableLine[]>(
     () =>
+      purchaseOrder?.lines.map(newLine) ||
       salesOrder?.lines.map(newLine) ||
       invoice?.lines.map(newLine) ||
       initial?.lines.map((line) =>
@@ -679,7 +689,16 @@ export function TransactionForm({
                   customerId: initial && 'customerId' in initial ? initial.customerId : undefined,
                 }).price,
               }
-            : {}),
+            : line.cost !== undefined
+              ? { cost: line.cost }
+              : {
+                  cost: A.purchaseLinePrice(
+                    state,
+                    initial && 'supplierId' in initial ? initial.supplierId : '',
+                    line.productId,
+                    line.unit || A.product(state, line.productId)!.unit,
+                  ),
+                }),
         }),
       ) || [newLine()],
   );
@@ -695,10 +714,20 @@ export function TransactionForm({
       invoice?.customerId ||
       (initial && 'customerId' in initial ? initial.customerId : ''),
   );
+  const [supplierId, setSupplierId] = useState(
+    purchaseOrder?.supplierId || (initial && 'supplierId' in initial ? initial.supplierId : ''),
+  );
   const [allowShortDated, setAllowShortDated] = useState(
     salesOrder?.allowShortDated || invoice?.allowShortDated || false,
   );
-  const [invoiceDate, setInvoiceDate] = useState(salesOrder?.date || invoice?.date || A.today());
+  const [invoiceDate, setInvoiceDate] = useState(
+    purchaseOrder?.date || salesOrder?.date || invoice?.date || A.today(),
+  );
+  const [expected, setExpected] = useState(
+    () =>
+      purchaseOrder?.expected ||
+      (supplierId ? A.expectedDate(state, supplierId, invoiceDate) : A.shift(5, invoiceDate)),
+  );
   const defaultDue = (date: string, customer: string) =>
     A.shift(
       A.contact(state, customer)?.paymentTermsDays ?? state.settings.defaultPaymentTermsDays,
@@ -719,6 +748,12 @@ export function TransactionForm({
       (Number(l.qty) - (salesOrder?.lines.find((old) => old.id === l.id)?.cancelledQty || 0)) *
       Number(l.price),
   );
+  const poApprovalReq =
+    purchase &&
+    A.approvalRequired(state, {
+      total: subtotal,
+      approval: purchaseOrder?.approval,
+    });
   const discountValue = purchase
       ? 0
       : order
@@ -752,7 +787,7 @@ export function TransactionForm({
             price: String(
               p
                 ? purchase
-                  ? A.unitPrice(p, unit, true)
+                  ? A.purchaseLinePrice(state, supplierId, p.id, unit || p.unit)
                   : A.priceFor(state, { productId: p.id, unit: unit || p.unit, customerId }).price
                 : 0,
             ),
@@ -790,7 +825,7 @@ export function TransactionForm({
         factor: A.unitFactor(p, unit),
         qty: 1,
         price: purchase
-          ? A.unitPrice(p, unit, true)
+          ? A.purchaseLinePrice(state, supplierId, p.id, unit)
           : A.priceFor(state, { productId: p.id, unit, customerId }).price,
       });
       const blank = current.find((line) => !line.productId);
@@ -845,20 +880,47 @@ export function TransactionForm({
             issuing ? 'Order confirmed.' : 'Order saved.',
             (saved) => open('order-detail', saved.id),
           );
-        } else if (purchase)
+        } else if (purchase) {
+          const sending = mode === 'send';
           mutate(
-            (s) =>
-              A.createPurchase(s, {
+            (s) => {
+              if (id) {
+                const po = A.savePurchase(
+                  s,
+                  {
+                    supplierId: data.supplierId,
+                    warehouseId: data.warehouseId,
+                    date: data.date,
+                    expected: data.expected,
+                    lines: lines.map((line, index) => ({ ...items[index], id: line.id })),
+                    notes: data.notes,
+                  },
+                  id,
+                );
+                if (sending) {
+                  A.sendPurchase(s, id, data.date > A.today() ? A.today() : data.date);
+                }
+                return po;
+              }
+              return A.createPurchase(s, {
                 supplierId: data.supplierId,
                 warehouseId: data.warehouseId,
                 date: data.date,
                 expected: data.expected,
                 lines: items,
                 notes: data.notes,
-              }),
-            'Purchase order created.',
+                send: sending,
+              });
+            },
+            id
+              ? sending
+                ? 'Purchase order sent.'
+                : 'Purchase order saved.'
+              : sending
+                ? 'Purchase order sent.'
+                : 'Draft saved.',
           );
-        else
+        } else
           mutate(
             (s) => {
               const i = A.createInvoice(
@@ -896,7 +958,25 @@ export function TransactionForm({
             <SelectField
               label="Supplier"
               name="supplierId"
-              defaultValue={initial && 'supplierId' in initial ? initial.supplierId : undefined}
+              disabled={purchaseOrder?.status === 'Sent'}
+              defaultValue={supplierId}
+              onChange={(value) => {
+                setSupplierId(value);
+                if (value) {
+                  setExpected(A.expectedDate(state, value, invoiceDate));
+                  setLines((current) =>
+                    current.map((line) => {
+                      const p = A.product(state, line.productId);
+                      if (!p) return line;
+                      const unit = line.unit || p.unit;
+                      return {
+                        ...line,
+                        price: String(A.purchaseLinePrice(state, value, p.id, unit)),
+                      };
+                    }),
+                  );
+                }
+              }}
               full
             >
               <ContactOptions type="Supplier" />
@@ -906,20 +986,30 @@ export function TransactionForm({
               label="Receiving warehouse"
               name="warehouseId"
               defaultValue={
+                purchaseOrder?.warehouseId ||
                 (initial && 'warehouseId' in initial ? initial.warehouseId : undefined) ||
                 (coldOnly ? state.warehouses.find((w) => w.storage === 'cold')?.id : 'wh_main')
               }
             >
               <WarehouseOptions
                 coldOnly={coldOnly}
-                includeId={initial && 'warehouseId' in initial ? initial.warehouseId : undefined}
+                includeId={
+                  purchaseOrder?.warehouseId ||
+                  (initial && 'warehouseId' in initial ? initial.warehouseId : undefined)
+                }
               />
             </SelectField>
             <Field
               label="Order date"
               name="date"
               type="date"
-              defaultValue={A.today()}
+              value={invoiceDate}
+              onChange={(event) => {
+                setInvoiceDate(event.target.value);
+                if (supplierId && event.target.value) {
+                  setExpected(A.expectedDate(state, supplierId, event.target.value));
+                }
+              }}
               max={A.today()}
               required
             />
@@ -927,7 +1017,8 @@ export function TransactionForm({
               label="Expected delivery"
               name="expected"
               type="date"
-              defaultValue={A.shift(5)}
+              value={expected}
+              onChange={(event) => setExpected(event.target.value)}
               full
               required
             />
@@ -1037,6 +1128,27 @@ export function TransactionForm({
         </Callout>
       )}
       {coldOnly && <Callout>Cold-chain product — cold storage only</Callout>}
+      {purchase &&
+        state.settings.poApprovalLimit > 0 &&
+        subtotal > state.settings.poApprovalLimit && (
+          <Callout>
+            Orders over {money(state.settings.poApprovalLimit)} need approval before they&apos;re
+            sent.
+          </Callout>
+        )}
+      {purchase &&
+        supplierId &&
+        (() => {
+          const minOrder = A.belowMinimumOrder(state, supplierId, subtotal);
+          const supplier = A.contact(state, supplierId);
+          if (minOrder === null || !supplier) return null;
+          return (
+            <Callout>
+              {supplier.name}&apos;s minimum order is {money(minOrder)}. This order is{' '}
+              {money(subtotal)}.
+            </Callout>
+          );
+        })()}
       <Field
         label="Scan barcode"
         name="scanBarcode"
@@ -1144,6 +1256,18 @@ export function TransactionForm({
                     </>
                   )}
                   {p && !validUnit && !purchase && <Badge status="Manual" />}
+                  {p && unit && purchase && (
+                    <small className="muted text-[9px] block mt-[5px]">
+                      {(() => {
+                        const last = supplierId
+                          ? A.lastPurchasePrice(state, supplierId, p.id, unit)
+                          : null;
+                        return last
+                          ? `Last paid ${money(last.price)} on ${shortDate(last.date).replace('Sept', 'Sep')} (${last.reference})`
+                          : 'No previous purchase — default cost';
+                      })()}
+                    </small>
+                  )}
                 </div>
                 <span className="line-total">{money(Number(line.qty) * Number(line.price))}</span>
                 <IconButton
@@ -1222,6 +1346,7 @@ export function TransactionForm({
           name="notes"
           id="f-notes"
           defaultValue={
+            purchaseOrder?.notes ??
             salesOrder?.notes ??
             invoice?.notes ??
             (purchase
@@ -1255,7 +1380,34 @@ export function TransactionForm({
           )}
         </>
       ) : purchase ? (
-        <FormFooter label="Create purchase order" />
+        <div className="form-footer">
+          <Button icon="close" tone="" onClick={close}>
+            Cancel
+          </Button>
+          {purchaseOrder?.status === 'Sent' ? (
+            <button type="submit" className="btn primary" value="draft">
+              Save order
+            </button>
+          ) : (
+            <>
+              <button type="submit" className="btn" value="draft">
+                Save draft
+              </button>
+              <button
+                type="submit"
+                className="btn primary"
+                value="send"
+                disabled={poApprovalReq}
+                title={poApprovalReq ? 'Approval required before sending' : undefined}
+              >
+                Save & send
+              </button>
+              {poApprovalReq && (
+                <small className="muted self-center">Approval required before sending</small>
+              )}
+            </>
+          )}
+        </div>
       ) : (
         <>
           <Callout>
@@ -1454,16 +1606,18 @@ function PriceSource({
 }
 export function PaymentForm({ id }: { id: string; bill?: boolean }) {
   const { state, mutate } = useWorkspace();
-  const item = [...state.purchases, ...state.receipts].find((i) => i.id === id);
-  if (!item) return null;
-  const amount = A.round(item.total - item.paid);
+  const receipt = state.receipts.find((r) => r.id === id);
+  if (!receipt) return null;
+  const amount = A.billBalance(receipt);
   return (
     <WorkspaceForm
       onSubmit={(data) =>
         mutate((s) => A.payBill(s, id, data.amount, data.date), 'Supplier payment recorded.')
       }
     >
-      <Callout>Outstanding {money(amount)}</Callout>
+      <Callout>
+        Bill {receipt.number} · Outstanding {money(amount)}
+      </Callout>
       <div className="form-grid">
         <Field
           label="Payment amount ($)"
@@ -1489,64 +1643,296 @@ export function PaymentForm({ id }: { id: string; bill?: boolean }) {
     </WorkspaceForm>
   );
 }
+
+interface ReceiveRowItem {
+  key: string;
+  purchaseLineId: string;
+  qty: string;
+  price: string;
+  code: string;
+  expiry: string;
+}
+
 export function PurchaseReceiveForm({ id }: { id: string }) {
   const { state, mutate } = useWorkspace();
-  const p = state.purchases.find((p) => p.id === id);
-  if (!p || p.status !== 'Ordered')
-    return <Callout>This order is already received or canceled.</Callout>;
+  const p = state.purchases.find((item) => item.id === id);
+  if (!p) return <Empty />;
+  if (p.status === 'Draft') return <Callout>Send this purchase order before receiving it.</Callout>;
+  if (p.status !== 'Sent') return <Callout>This order is already received or canceled.</Callout>;
+
+  const openLines = p.lines.filter((line) => A.openQty(state, p, line) > 0);
+  if (openLines.length === 0)
+    return (
+      <Callout>All items on this purchase order have already been received or closed.</Callout>
+    );
+
+  const [rows, setRows] = useState<ReceiveRowItem[]>(() =>
+    openLines.map((line, idx) => ({
+      key: `${line.id}-${idx}`,
+      purchaseLineId: line.id,
+      qty: String(A.openQty(state, p, line)),
+      price: String(line.price),
+      code: '',
+      expiry: A.shift(365),
+    })),
+  );
+
+  const [closeRemaining, setCloseRemaining] = useState(false);
+  const [closeReason, setCloseReason] = useState('');
+
+  const anyOpenRemaining = p.lines.some((line) => {
+    const open = A.openQty(state, p, line);
+    const receivingThisTime = rows
+      .filter((r) => r.purchaseLineId === line.id)
+      .reduce((sum, r) => sum + (Number(r.qty) || 0), 0);
+    return open - receivingThisTime > 0;
+  });
+
+  function updateRow(key: string, updates: Partial<ReceiveRowItem>) {
+    setRows((current) => current.map((r) => (r.key === key ? { ...r, ...updates } : r)));
+  }
+
+  function splitLot(lineId: string) {
+    const poLine = p!.lines.find((l) => l.id === lineId);
+    setRows((current) => [
+      ...current,
+      {
+        key: `${lineId}-${Date.now()}-${Math.random()}`,
+        purchaseLineId: lineId,
+        qty: '0',
+        price: String(poLine?.price ?? 0),
+        code: '',
+        expiry: A.shift(365),
+      },
+    ]);
+  }
+
+  function removeLotRow(key: string) {
+    setRows((current) => current.filter((r) => r.key !== key));
+  }
+
+  const activeRows = rows.filter((r) => Number(r.qty) > 0);
+  const billTotal = A.round(
+    A.sum(activeRows, (r) => (Number(r.qty) || 0) * (Number(r.price) || 0)),
+  );
+  const orderedValue = A.round(
+    A.sum(activeRows, (r) => {
+      const poLine = p!.lines.find((l) => l.id === r.purchaseLineId);
+      return (Number(r.qty) || 0) * (poLine?.price ?? 0);
+    }),
+  );
+  const diff = A.round(billTotal - orderedValue);
+  const diffFormatted = diff >= 0 ? `+${money(diff)}` : `-${money(Math.abs(diff))}`;
+
+  return (
+    <WorkspaceForm
+      onSubmit={(data) => {
+        const receivedLines = rows
+          .filter((r) => Number(r.qty) > 0)
+          .map((r) => ({
+            purchaseLineId: r.purchaseLineId,
+            qty: Number(r.qty),
+            price: Number(r.price),
+            code: r.code,
+            expiry: r.expiry,
+          }));
+        mutate(
+          (s) =>
+            A.receivePurchase(s, id, {
+              date: data.date,
+              reference: data.reference,
+              notes: data.notes,
+              lines: receivedLines,
+              closeRemaining:
+                closeRemaining && closeReason.trim() ? { reason: closeReason.trim() } : undefined,
+            }),
+          'Purchase order received. Stock and supplier bill created.',
+        );
+      }}
+    >
+      <div className="form-grid">
+        <Field
+          label="Receipt date"
+          name="date"
+          type="date"
+          defaultValue={A.today()}
+          max={A.today()}
+          required
+        />
+        <Field
+          label="Supplier invoice / delivery note no."
+          name="reference"
+          placeholder="e.g. INV-10492"
+        />
+        <Field label="Notes" name="notes" placeholder="Delivery notes or comments" full />
+      </div>
+
+      {openLines.map((line) => {
+        const lineReceived = A.receivedQty(state, p, line.id);
+        const lineOpen = A.openQty(state, p, line);
+        const prod = A.product(state, line.productId);
+        const lineRows = rows.filter((r) => r.purchaseLineId === line.id);
+
+        return (
+          <div key={line.id} className="mt-[16px]">
+            <div className="form-section flex items-center justify-between">
+              <div>
+                {line.name}{' '}
+                <span className="muted font-normal">
+                  · {number(line.qty)} {A.unitLabel(line.unit, line.qty)} (={' '}
+                  {prod
+                    ? A.formatQty(prod, line.qty * line.factor).main
+                    : `${line.qty * line.factor} base`}
+                  ) · Ordered: {number(line.qty)} · Received: {number(lineReceived)} · Open:{' '}
+                  {number(lineOpen)}
+                </span>
+              </div>
+              <Button
+                type="button"
+                tone=""
+                icon="plus"
+                className="!py-[3px] !px-[8px] text-[12px]"
+                onClick={() => splitLot(line.id)}
+              >
+                Split lot
+              </Button>
+            </div>
+
+            {lineRows.map((row) => {
+              const rowCost = Number(row.price) || 0;
+              const costDiff = A.round(rowCost - line.price);
+              const costDiffLabel =
+                costDiff !== 0
+                  ? costDiff > 0
+                    ? `+$${costDiff.toFixed(2)} vs PO`
+                    : `-$${Math.abs(costDiff).toFixed(2)} vs PO`
+                  : undefined;
+
+              return (
+                <div
+                  key={row.key}
+                  className="p-[10px] bg-[rgba(0,0,0,0.02)] rounded-[6px] mb-[8px]"
+                >
+                  <div className="form-grid">
+                    <Field
+                      label={`Receive now (${A.unitLabel(line.unit)})`}
+                      name={`qty-${row.key}`}
+                      type="number"
+                      value={row.qty}
+                      min="0"
+                      step="1"
+                      onChange={(e) => updateRow(row.key, { qty: e.target.value })}
+                      required
+                    />
+                    <Field
+                      label={`Actual cost per ${line.unit} ($)`}
+                      name={`cost-${row.key}`}
+                      type="number"
+                      value={row.price}
+                      min="0"
+                      step="0.01"
+                      hint={costDiffLabel}
+                      onChange={(e) => updateRow(row.key, { price: e.target.value })}
+                      required
+                    />
+                    <Field
+                      label="Actual batch / lot number"
+                      name={`code-${row.key}`}
+                      value={row.code}
+                      onChange={(e) => updateRow(row.key, { code: e.target.value })}
+                      required={Number(row.qty) > 0}
+                    />
+                    <Field
+                      label="Actual expiry date"
+                      name={`expiry-${row.key}`}
+                      type="date"
+                      min={A.shift(1)}
+                      value={row.expiry}
+                      onChange={(e) => updateRow(row.key, { expiry: e.target.value })}
+                      required={Number(row.qty) > 0}
+                    />
+                  </div>
+                  {lineRows.length > 1 && (
+                    <div className="flex justify-end mt-[4px]">
+                      <Button
+                        type="button"
+                        tone="danger"
+                        icon="trash"
+                        className="!py-[2px] !px-[6px] text-[11px]"
+                        onClick={() => removeLotRow(row.key)}
+                      >
+                        Remove lot row
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+
+      {anyOpenRemaining && (
+        <div className="form-field full mt-[12px]">
+          <label className="checkbox-label flex items-center gap-[8px] cursor-pointer">
+            <input
+              type="checkbox"
+              checked={closeRemaining}
+              onChange={(e) => setCloseRemaining(e.target.checked)}
+            />
+            <span>Close the rest of this order</span>
+          </label>
+          {closeRemaining && (
+            <Field
+              label="Reason for closing remainder"
+              name="closeReason"
+              value={closeReason}
+              onChange={(e) => setCloseReason(e.target.value)}
+              placeholder="e.g. Supplier out of stock until next quarter"
+              required
+              full
+            />
+          )}
+        </div>
+      )}
+
+      <Callout>
+        Bill total {money(billTotal)} · ordered value of these items {money(orderedValue)} ·
+        difference {diffFormatted}
+      </Callout>
+
+      <FormFooter label="Receive" />
+    </WorkspaceForm>
+  );
+}
+
+export function CloseRemainderForm({ id }: { id: string }) {
+  const { state, mutate } = useWorkspace();
+  const p = state.purchases.find((item) => item.id === id);
+  if (!p) return <Empty />;
   return (
     <WorkspaceForm
       onSubmit={(data) =>
         mutate(
-          (s) =>
-            A.receivePurchase(
-              s,
-              id,
-              p.lines.map((_, index) => ({
-                code: data[`batch-${index}`],
-                expiry: data[`expiry-${index}`],
-              })),
-              data.date,
-            ),
-          'Purchase order received. Stock and payables updated.',
+          (s) => A.closeRemaining(s, id, data.reason),
+          'Purchase order remainder closed.',
+          undefined,
+          true,
         )
       }
     >
-      <Field
-        label="Receipt date"
-        name="date"
-        type="date"
-        defaultValue={A.today()}
-        max={A.today()}
-        required
-      />
-      {p.lines.map((line, index) => (
-        <div key={index}>
-          <div className="form-section">
-            {line.name}{' '}
-            <span className="muted font-normal">
-              · {number(line.qty)} {A.unitLabel(line.unit, line.qty)} (={' '}
-              {A.formatQty(A.product(state, line.productId)!, line.qty * line.factor).main})
-            </span>
-          </div>
-          <div className="form-grid">
-            <Field label="Actual batch / lot number" name={`batch-${index}`} required />
-            <Field
-              label="Actual expiry date"
-              name={`expiry-${index}`}
-              type="date"
-              min={A.shift(1)}
-              required
-            />
-          </div>
-        </div>
-      ))}
       <Callout>
-        Receives all ordered units into {A.warehouse(state, p.warehouseId)?.name}. The supplier bill
-        is {money(p.total)}; any difference from the rounded base-unit stock value is posted as
-        Purchase rounding.
+        Closing the remainder marks this purchase order as Received and cancels any outstanding
+        quantities.
       </Callout>
-      <FormFooter label="Receive all items" />
+      <Field
+        label="Reason for closing remainder"
+        name="reason"
+        placeholder="e.g. Supplier out of stock until next quarter"
+        required
+        full
+      />
+      <FormFooter label="Close remainder" />
     </WorkspaceForm>
   );
 }
@@ -1623,6 +2009,8 @@ export function ContactForm({ id }: { id?: string }) {
                 billing: data.billing as 'per_delivery' | 'monthly',
                 onHold,
                 holdReason: data.holdReason || '',
+                leadTimeDays: data.leadTimeDays,
+                minOrderValue: data.minOrderValue || null,
               },
               id,
             ),
@@ -1714,6 +2102,41 @@ export function ContactForm({ id }: { id?: string }) {
             {onHold && (
               <Field label="Hold reason" name="holdReason" defaultValue={c?.holdReason} required />
             )}
+          </div>
+        </>
+      )}
+      {type === 'Supplier' && (
+        <>
+          <div className="form-section">Supplier account</div>
+          <div className="form-grid">
+            <Field
+              label="Payment terms (days)"
+              name="paymentTermsDays"
+              type="number"
+              defaultValue={c?.paymentTermsDays ?? state.settings.defaultPaymentTermsDays}
+              min="0"
+              max="365"
+              step="1"
+              required
+            />
+            <Field
+              label="Lead time (days)"
+              name="leadTimeDays"
+              type="number"
+              defaultValue={c?.leadTimeDays ?? 0}
+              min="0"
+              max="365"
+              step="1"
+              required
+            />
+            <Field
+              label="Minimum order ($, optional)"
+              name="minOrderValue"
+              type="number"
+              defaultValue={c?.minOrderValue ?? ''}
+              min="0"
+              step="0.01"
+            />
           </div>
         </>
       )}

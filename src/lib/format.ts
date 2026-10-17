@@ -13,13 +13,16 @@ export const compactMoney = (value = 0) =>
   }).format(value);
 export const number = (value = 0) => new Intl.NumberFormat('en-US').format(value);
 export const date = (value: string) =>
-  new Date(`${value}T12:00:00`).toLocaleDateString('en-GB', {
+  new Date(value.includes('T') ? value : `${value}T12:00:00`).toLocaleDateString('en-GB', {
     day: '2-digit',
     month: 'short',
     year: 'numeric',
   });
 export const shortDate = (value: string) =>
-  new Date(`${value}T12:00:00`).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+  new Date(value.includes('T') ? value : `${value}T12:00:00`).toLocaleDateString('en-GB', {
+    day: '2-digit',
+    month: 'short',
+  });
 export const initials = (name = '') =>
   name
     .split(' ')

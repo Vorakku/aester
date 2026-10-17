@@ -123,7 +123,7 @@ function SuggestionGroup({ items }: { items: Suggestion[] }) {
                   productId: s.productId,
                   unit: s.orderUnit,
                   qty: s.orderQty,
-                  cost: A.unitPrice(A.product(state, s.productId)!, s.orderUnit, true),
+                  cost: A.purchaseLinePrice(state, first.supplierId, s.productId, s.orderUnit),
                 })),
               })
             }

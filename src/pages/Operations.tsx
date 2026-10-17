@@ -3,7 +3,7 @@ import { CreditNotesTable } from '../components/creditNotes';
 import { useState } from 'react';
 import { useWorkspace } from '../context/WorkspaceContext';
 import { A } from '../lib/model';
-import { compactMoney, date, initials, money, number } from '../lib/format';
+import { compactMoney, date, initials, money, number, shortDate } from '../lib/format';
 import { exportAdjustments, exportData, exportStockLedger, type ExportType } from '../lib/exports';
 import {
   Badge,
@@ -883,18 +883,39 @@ export function WarehousesPage() {
   );
 }
 export function PurchasingPage() {
-  const { state, open } = useWorkspace();
+  const { state, open, mutate } = useWorkspace();
   const [tab, setTab] = useState('orders');
   const [q, setQ] = useState(''),
     [status, setStatus] = useState('');
+  const [receiptQ, setReceiptQ] = useState(''),
+    [receiptStatus, setReceiptStatus] = useState('');
+
   const items = state.purchases.filter(
     (p) =>
       `${p.number} ${A.contact(state, p.supplierId)?.name}`
         .toLowerCase()
         .includes(q.toLowerCase()) &&
-      (!status || p.status === status),
+      (!status ||
+        (status === 'Partly received'
+          ? A.purchaseStatus(state, p) === 'Partly received'
+          : p.status === status)),
   );
-  const ordered = state.purchases.filter((p) => p.status === 'Ordered');
+  const ordered = state.purchases.filter((p) => ['Draft', 'Sent'].includes(p.status));
+
+  const receiptItems = state.receipts
+    .filter((r) => {
+      const supplier = A.contact(state, r.supplierId);
+      const po = r.purchaseId ? state.purchases.find((p) => p.id === r.purchaseId) : undefined;
+      const matchesQ =
+        `${r.number} ${supplier?.name || ''} ${r.reference || ''} ${po?.number || ''}`
+          .toLowerCase()
+          .includes(receiptQ.toLowerCase());
+      const rStatus = A.billStatus(r);
+      const matchesStatus = !receiptStatus || receiptStatus === 'All' || rStatus === receiptStatus;
+      return matchesQ && matchesStatus;
+    })
+    .sort((a, b) => b.date.localeCompare(a.date));
+
   return (
     <>
       <Heading
@@ -917,12 +938,7 @@ export function PurchasingPage() {
         />
         <Metric
           label="Supplier bills due"
-          value={compactMoney(
-            A.sum(
-              [...state.purchases.filter((p) => p.status === 'Received'), ...state.receipts],
-              (p) => p.total - p.paid,
-            ),
-          )}
+          value={compactMoney(A.sum(state.receipts, (r) => A.billBalance(r)))}
           icon="wallet"
           foot="Outstanding accounts payable"
         />
@@ -931,12 +947,110 @@ export function PurchasingPage() {
         <button className={tab === 'orders' ? 'active' : ''} onClick={() => setTab('orders')}>
           Purchase orders
         </button>
+        <button className={tab === 'receipts' ? 'active' : ''} onClick={() => setTab('receipts')}>
+          Receipts &amp; bills
+        </button>
         <button className={tab === 'reorder' ? 'active' : ''} onClick={() => setTab('reorder')}>
           Reorder suggestions
         </button>
       </div>
       {tab === 'reorder' ? (
         <ReorderSuggestions />
+      ) : tab === 'receipts' ? (
+        <section className="panel">
+          <div className="toolbar">
+            <div className="toolbar-left">
+              <SearchInput
+                value={receiptQ}
+                onChange={setReceiptQ}
+                placeholder="Search GRN, supplier, reference, or PO..."
+              />
+              <Filter
+                label="Bill status"
+                value={receiptStatus}
+                onChange={setReceiptStatus}
+                items={['All', 'Open', 'Partly paid', 'Paid', 'Overdue']}
+              />
+            </div>
+            <ExportButton type="receipts" />
+          </div>
+          <DataTable
+            items={receiptItems}
+            filterKey={`${receiptQ}|${receiptStatus}`}
+            columns={[
+              'GRN',
+              'Date',
+              'Supplier',
+              'PO',
+              'Reference',
+              'Total',
+              'Balance',
+              'Due',
+              'Status',
+              '',
+            ]}
+            row={(r) => {
+              const supplier = A.contact(state, r.supplierId);
+              const po = r.purchaseId
+                ? state.purchases.find((p) => p.id === r.purchaseId)
+                : undefined;
+              const balance = A.billBalance(r);
+              const rStatus = A.billStatus(r);
+              return (
+                <tr key={r.id}>
+                  <td>
+                    <button
+                      className="table-link mono font-semibold"
+                      onClick={() => open('receipt-detail', r.id)}
+                    >
+                      {r.number}
+                    </button>
+                  </td>
+                  <td>{shortDate(r.date)}</td>
+                  <td>
+                    <strong>{supplier?.name || '—'}</strong>
+                  </td>
+                  <td>
+                    {po ? (
+                      <button
+                        className="table-link mono"
+                        onClick={() => open('purchase-detail', po.id)}
+                      >
+                        {po.number}
+                      </button>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
+                  <td>{r.reference || '—'}</td>
+                  <td className="num">
+                    <strong>{money(r.total)}</strong>
+                  </td>
+                  <td className="num">
+                    <strong>{money(balance)}</strong>
+                  </td>
+                  <td>{shortDate(r.due)}</td>
+                  <td>
+                    <Badge status={rStatus} />
+                  </td>
+                  <td>
+                    {balance > 0 ? (
+                      <Button tone="small" icon="wallet" onClick={() => open('bill-payment', r.id)}>
+                        Pay
+                      </Button>
+                    ) : (
+                      <IconButton
+                        name="eye"
+                        label="View receipt"
+                        onClick={() => open('receipt-detail', r.id)}
+                      />
+                    )}
+                  </td>
+                </tr>
+              );
+            }}
+          />
+        </section>
       ) : (
         <section className="panel">
           <div className="toolbar">
@@ -950,7 +1064,7 @@ export function PurchasingPage() {
                 label="Order status"
                 value={status}
                 onChange={setStatus}
-                items={['Ordered', 'Received', 'Canceled']}
+                items={['Draft', 'Sent', 'Partly received', 'Received', 'Canceled']}
               />
             </div>
             <ExportButton type="purchases" />
@@ -975,10 +1089,21 @@ export function PurchasingPage() {
                   <strong>{money(p.total)}</strong>
                 </td>
                 <td>
-                  <Badge status={p.status} />
+                  <div className="flex items-center gap-[6px]">
+                    <Badge status={A.purchaseStatus(state, p)} />
+                    {A.approvalRequired(state, p) && <Badge status="Needs approval" />}
+                  </div>
                 </td>
                 <td>
-                  {p.status === 'Ordered' ? (
+                  {p.status === 'Draft' ? (
+                    <Button
+                      tone="small"
+                      disabled={A.approvalRequired(state, p)}
+                      onClick={() => mutate((s) => A.sendPurchase(s, p.id), 'Purchase order sent.')}
+                    >
+                      Send
+                    </Button>
+                  ) : p.status === 'Sent' ? (
                     <Button
                       icon="receive"
                       tone="small"
@@ -1236,11 +1361,8 @@ export function ContactsPage() {
                       A.invoiceBalance,
                     )
                   : A.sum(
-                      [
-                        ...state.purchases.filter((p) => p.status === 'Received'),
-                        ...state.receipts,
-                      ].filter((p) => p.supplierId === c.id),
-                      (p) => p.total - p.paid,
+                      state.receipts.filter((r) => r.supplierId === c.id),
+                      A.billBalance,
                     );
               return (
                 <tr key={c.id}>

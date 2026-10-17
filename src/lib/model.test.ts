@@ -425,6 +425,23 @@ function assertInvariants(s: Workspace) {
       expect(A.openQty(s, o, l.id)).toBeGreaterThanOrEqual(0);
     }),
   );
+  s.purchases.forEach((po) => {
+    po.lines.forEach((l) => {
+      expect(A.receivedQty(s, po, l.id) + l.closedQty).toBeLessThanOrEqual(l.qty);
+      expect(A.openQty(s, po, l)).toBeGreaterThanOrEqual(0);
+    });
+  });
+  s.receipts
+    .filter((r) => !r.legacy)
+    .forEach((r) => {
+      const moves = s.stockMoves.filter((m) => m.type === 'receipt' && m.sourceId === r.id);
+      expect(moves).toHaveLength(r.lines.length);
+      r.lines.forEach((l) => {
+        const match = moves.find((m) => m.batchId === l.batchId && m.qty === l.qty * l.factor);
+        expect(match).toBeDefined();
+      });
+    });
+  expect(A.balances(s).payable.balance).toBe(A.round(A.sum(s.receipts, A.billBalance)));
   expect(A.validateBackup(JSON.parse(JSON.stringify(s)))).toEqual(s);
 }
 function empty(): Workspace {
@@ -486,6 +503,1257 @@ function stocked() {
   });
   return { s, supplier, customer, p, late, early };
 }
+
+describe('supplier accounts', () => {
+  const baseContact = { person: '', email: '', phone: '', address: '' };
+
+  it('stores supplier terms, lead time and minimum order, rejects invalid values, and keeps values when editing without fields', () => {
+    const { s } = stocked();
+    const supplier = A.saveContact(s, {
+      ...baseContact,
+      type: 'Supplier',
+      name: 'MediCare Supplies',
+      paymentTermsDays: 45,
+      leadTimeDays: 5,
+      minOrderValue: 500,
+    });
+    expect(supplier.paymentTermsDays).toBe(45);
+    expect(supplier.leadTimeDays).toBe(5);
+    expect(supplier.minOrderValue).toBe(500);
+
+    // Invalid values throw the spec's messages
+    expect(() =>
+      A.saveContact(s, {
+        ...baseContact,
+        type: 'Supplier',
+        name: 'Bad Terms',
+        paymentTermsDays: 400,
+      }),
+    ).toThrow('Payment terms must be a whole number between 0 and 365 days.');
+    expect(() =>
+      A.saveContact(s, {
+        ...baseContact,
+        type: 'Supplier',
+        name: 'Bad Terms',
+        paymentTermsDays: -1,
+      }),
+    ).toThrow('Payment terms must be a whole number between 0 and 365 days.');
+    expect(() =>
+      A.saveContact(s, {
+        ...baseContact,
+        type: 'Supplier',
+        name: 'Bad Terms',
+        paymentTermsDays: 1.5,
+      }),
+    ).toThrow('Payment terms must be a whole number between 0 and 365 days.');
+    expect(() =>
+      A.saveContact(s, { ...baseContact, type: 'Supplier', name: 'Bad Lead', leadTimeDays: -1 }),
+    ).toThrow('Lead time must be a whole number between 0 and 365 days.');
+    expect(() =>
+      A.saveContact(s, { ...baseContact, type: 'Supplier', name: 'Bad Lead', leadTimeDays: 366 }),
+    ).toThrow('Lead time must be a whole number between 0 and 365 days.');
+    expect(() =>
+      A.saveContact(s, {
+        ...baseContact,
+        type: 'Supplier',
+        name: 'Bad Min Zero',
+        minOrderValue: 0,
+      }),
+    ).toThrow('Minimum order must be greater than zero.');
+    expect(() =>
+      A.saveContact(s, {
+        ...baseContact,
+        type: 'Supplier',
+        name: 'Bad Min Neg',
+        minOrderValue: -10,
+      }),
+    ).toThrow('Minimum order must be between 0 and 100,000,000.');
+
+    // Editing without the fields keeps them
+    const edited = A.saveContact(
+      s,
+      { ...baseContact, type: 'Supplier', name: 'MediCare Supplies Renamed' },
+      supplier.id,
+    );
+    expect(edited.paymentTermsDays).toBe(45);
+    expect(edited.leadTimeDays).toBe(5);
+    expect(edited.minOrderValue).toBe(500);
+
+    // Setting minOrderValue to null or '' clears it to null
+    const cleared = A.saveContact(
+      s,
+      { ...baseContact, type: 'Supplier', name: 'MediCare Supplies Renamed', minOrderValue: null },
+      supplier.id,
+    );
+    expect(cleared.minOrderValue).toBeNull();
+    const emptyCleared = A.saveContact(
+      s,
+      { ...baseContact, type: 'Supplier', name: 'MediCare Supplies Renamed', minOrderValue: '' },
+      supplier.id,
+    );
+    expect(emptyCleared.minOrderValue).toBeNull();
+
+    assertInvariants(s);
+  });
+
+  it('customers always get leadTimeDays 0 and minOrderValue null, even if the input has values', () => {
+    const { s } = stocked();
+    const customer = A.saveContact(s, {
+      ...baseContact,
+      type: 'Customer',
+      name: 'Custom Customer',
+      leadTimeDays: 10,
+      minOrderValue: 200,
+    });
+    expect(customer.leadTimeDays).toBe(0);
+    expect(customer.minOrderValue).toBeNull();
+
+    const editedCustomer = A.saveContact(
+      s,
+      {
+        ...baseContact,
+        type: 'Customer',
+        name: 'Custom Customer Edited',
+        leadTimeDays: 14,
+        minOrderValue: 500,
+      },
+      customer.id,
+    );
+    expect(editedCustomer.leadTimeDays).toBe(0);
+    expect(editedCustomer.minOrderValue).toBeNull();
+
+    assertInvariants(s);
+  });
+
+  it('lastPurchasePrice returns newest received PO line, ignores other suppliers/units/non-received POs, and returns null without history', () => {
+    const { s, supplier, p } = stocked();
+    A.saveProduct(
+      s,
+      {
+        ...p,
+        packs: [{ unit: 'carton', factor: 10, barcode: '' }],
+      },
+      p.id,
+    );
+
+    // Returns null when there's no history
+    expect(A.lastPurchasePrice(s, supplier.id, p.id, 'box')).toBeNull();
+
+    // Ignores POs that aren't Received
+    const poDraft = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-10),
+      expected: A.shift(-5),
+      lines: [{ productId: p.id, qty: 5, cost: 7.5 }],
+    });
+    expect(A.lastPurchasePrice(s, supplier.id, p.id, 'box')).toBeNull();
+
+    // Receive the PO
+    A.sendPurchase(s, poDraft.id, A.shift(-8));
+    const rc1 = A.receivePurchase(s, poDraft.id, {
+      lines: [
+        { purchaseLineId: poDraft.lines[0].id, qty: 5, code: 'LOT-REC-1', expiry: A.shift(300) },
+      ],
+      date: A.shift(-8),
+    });
+    expect(A.lastPurchasePrice(s, supplier.id, p.id, 'box')).toEqual({
+      price: 7.5,
+      date: A.shift(-8),
+      reference: rc1.number,
+    });
+
+    // Ignores other units
+    expect(A.lastPurchasePrice(s, supplier.id, p.id, 'carton')).toBeNull();
+
+    // Ignores other suppliers
+    const otherSupplier = A.saveContact(s, {
+      ...baseContact,
+      type: 'Supplier',
+      name: 'Other Supplier',
+    });
+    expect(A.lastPurchasePrice(s, otherSupplier.id, p.id, 'box')).toBeNull();
+
+    // Newer received PO line returned
+    const poNewer = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-4),
+      expected: A.shift(-1),
+      lines: [{ productId: p.id, qty: 10, cost: 8.4 }],
+    });
+    A.sendPurchase(s, poNewer.id, A.shift(-2));
+    const rc2 = A.receivePurchase(s, poNewer.id, {
+      lines: [
+        { purchaseLineId: poNewer.lines[0].id, qty: 10, code: 'LOT-REC-2', expiry: A.shift(300) },
+      ],
+      date: A.shift(-2),
+    });
+    expect(A.lastPurchasePrice(s, supplier.id, p.id, 'box')).toEqual({
+      price: 8.4,
+      date: A.shift(-2),
+      reference: rc2.number,
+    });
+
+    // Tie breaker: higher PO number wins if same received date
+    const po3 = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-1),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 10, cost: 9.1 }],
+    });
+    const po4 = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-1),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 10, cost: 9.5 }],
+    });
+    A.sendPurchase(s, po3.id, A.today());
+    A.sendPurchase(s, po4.id, A.today());
+    A.receivePurchase(s, po3.id, {
+      lines: [
+        { purchaseLineId: po3.lines[0].id, qty: 10, code: 'LOT-REC-3', expiry: A.shift(300) },
+      ],
+      date: A.today(),
+    });
+    const rc4 = A.receivePurchase(s, po4.id, {
+      lines: [
+        { purchaseLineId: po4.lines[0].id, qty: 10, code: 'LOT-REC-4', expiry: A.shift(300) },
+      ],
+      date: A.today(),
+    });
+    expect(A.lastPurchasePrice(s, supplier.id, p.id, 'box')).toEqual({
+      price: 9.5,
+      date: A.today(),
+      reference: rc4.number,
+    });
+
+    assertInvariants(s);
+  });
+
+  it('createPurchase without a line cost uses the last price; without history it uses the product default; an explicit cost wins', () => {
+    const { s, supplier, p } = stocked();
+    const otherSupplier = A.saveContact(s, {
+      ...baseContact,
+      type: 'Supplier',
+      name: 'Fresh Supplier',
+    });
+
+    // Seed history on supplier: last price = 6.8
+    const histPO = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-5),
+      expected: A.shift(-2),
+      lines: [{ productId: p.id, qty: 5, cost: 6.8 }],
+    });
+    A.sendPurchase(s, histPO.id, A.shift(-4));
+    A.receivePurchase(s, histPO.id, {
+      lines: [{ purchaseLineId: histPO.lines[0].id, qty: 5, code: 'HIST-1', expiry: A.shift(200) }],
+      date: A.shift(-3),
+    });
+
+    // Without a line cost -> uses last price (6.8)
+    const poLast = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 10 }],
+    });
+    expect(poLast.lines[0].price).toBe(6.8);
+
+    // Without history -> uses product default cost (p.cost = 2)
+    const poDefault = A.createPurchase(s, {
+      supplierId: otherSupplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 10 }],
+    });
+    expect(poDefault.lines[0].price).toBe(p.cost);
+
+    // An explicit cost wins
+    const poExplicit = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 10, cost: 12.5 }],
+    });
+    expect(poExplicit.lines[0].price).toBe(12.5);
+
+    assertInvariants(s);
+  });
+
+  it('expectedDate adds the supplier lead time', () => {
+    const { s } = stocked();
+    const supplier = A.saveContact(s, {
+      ...baseContact,
+      type: 'Supplier',
+      name: 'Lead Time Supplier',
+      leadTimeDays: 7,
+    });
+    expect(A.expectedDate(s, supplier.id, '2026-08-10')).toBe('2026-08-17');
+    assertInvariants(s);
+  });
+
+  it('belowMinimumOrder returns the minimum only when the total is below it', () => {
+    const { s } = stocked();
+    const supplier = A.saveContact(s, {
+      ...baseContact,
+      type: 'Supplier',
+      name: 'Min Order Supplier',
+      minOrderValue: 400,
+    });
+    expect(A.belowMinimumOrder(s, supplier.id, 350)).toBe(400);
+    expect(A.belowMinimumOrder(s, supplier.id, 399.99)).toBe(400);
+    expect(A.belowMinimumOrder(s, supplier.id, 400)).toBeNull();
+    expect(A.belowMinimumOrder(s, supplier.id, 550)).toBeNull();
+
+    const noMinSupplier = A.saveContact(s, {
+      ...baseContact,
+      type: 'Supplier',
+      name: 'No Min Order Supplier',
+      minOrderValue: null,
+    });
+    expect(A.belowMinimumOrder(s, noMinSupplier.id, 50)).toBeNull();
+    assertInvariants(s);
+  });
+
+  it('reorderSuggestions estimatedCost uses the last price', () => {
+    const { s, supplier, p } = stocked();
+    A.saveProduct(s, { ...p, supplierId: supplier.id }, p.id);
+    A.saveReorderRule(s, { productId: p.id, warehouseId: 'wh_main', min: 10, max: 50 });
+    // Empty all batches of p
+    s.batches
+      .filter((b) => b.productId === p.id && b.qty > 0)
+      .forEach((b) => A.adjustStock(s, { batchId: b.id, qty: -b.qty, reason: 'damaged' }));
+
+    // Position is now 0 <= min 10. Max is 50. Order qty is 50.
+    // Without history: cost is p.cost = 2 -> 50 * 2 = 100
+    const sugDefault = A.reorderSuggestions(s, 'wh_main').find((x) => x.productId === p.id)!;
+    expect(sugDefault.estimatedCost).toBe(100);
+
+    // Record and receive a purchase order from this supplier with cost 4.5
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-3),
+      expected: A.shift(-1),
+      lines: [{ productId: p.id, qty: 5, cost: 4.5 }],
+    });
+    A.sendPurchase(s, po.id, A.shift(-2));
+    A.receivePurchase(s, po.id, [{ code: 'REC-SUG-LOT', expiry: A.shift(365) }], A.shift(-1));
+
+    // Clear the received batch so position is 0 again
+    const recBatch = s.batches.find((b) => b.code === 'REC-SUG-LOT')!;
+    A.adjustStock(s, { batchId: recBatch.id, qty: -recBatch.qty, reason: 'damaged' });
+
+    // Now reorder suggestion should use last price 4.5 -> 50 * 4.5 = 225
+    const sugLast = A.reorderSuggestions(s, 'wh_main').find((x) => x.productId === p.id)!;
+    expect(sugLast.estimatedCost).toBe(225);
+
+    assertInvariants(s);
+  });
+
+  it('migration: a v3 backup without the new fields loads with the defaults, and invariants hold', () => {
+    const raw = JSON.parse(JSON.stringify(A.seed()));
+    raw.version = 3;
+    raw.contacts.forEach((c: any) => {
+      delete c.leadTimeDays;
+      delete c.minOrderValue;
+    });
+    const loaded = A.validateBackup(raw);
+    loaded.contacts.forEach((c) => {
+      expect(c.leadTimeDays).toBe(0);
+      expect(c.minOrderValue).toBeNull();
+    });
+    assertInvariants(loaded);
+  });
+});
+
+describe('purchase order lifecycle and approvals (spec 002)', () => {
+  it('createPurchase makes a Draft; with send: true it is Sent; over limit without approval it throws and saves nothing', () => {
+    const { s, supplier, p } = stocked();
+    s.settings.poApprovalLimit = 2000;
+
+    // Default makes a Draft
+    const draft = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 10, cost: 50 }],
+    });
+    expect(draft.status).toBe('Draft');
+    expect(draft.total).toBe(500);
+    expect(draft.sentAt).toBeUndefined();
+    expect(draft.sentBy).toBeUndefined();
+    expect(draft.createdAt).toBeDefined();
+    expect(draft.createdBy).toBe('Krisstoff');
+
+    // With send: true under limit -> Sent
+    const sent = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 10, cost: 50 }],
+      send: true,
+    });
+    expect(sent.status).toBe('Sent');
+    expect(sent.sentAt).toBe(A.today());
+    expect(sent.sentBy).toBe('Krisstoff');
+
+    // Over limit with send: true throws and saves nothing
+    const countBefore = s.purchases.length;
+    expect(() =>
+      A.createPurchase(s, {
+        supplierId: supplier.id,
+        warehouseId: 'wh_main',
+        date: A.today(),
+        expected: A.shift(2),
+        lines: [{ productId: p.id, qty: 100, cost: 50 }], // total 5000 > 2000
+        send: true,
+      }),
+    ).toThrow('Purchase orders over $2,000.00 need approval before sending.');
+    expect(s.purchases.length).toBe(countBefore);
+
+    assertInvariants(s);
+  });
+
+  it('approvePurchase: records user, time, amount and note; refuses a PO under the limit, and a non-Draft', () => {
+    const { s, supplier, p } = stocked();
+    s.settings.poApprovalLimit = 2000;
+
+    const poOver = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 50, cost: 50 }], // 2500
+    });
+
+    const poUnder = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 10, cost: 50 }], // 500
+    });
+
+    // Refuses PO under limit
+    expect(() => A.approvePurchase(s, poUnder.id)).toThrow(
+      "This purchase order doesn't need approval.",
+    );
+
+    // Records user, time, amount and note on valid Draft
+    const approved = A.approvePurchase(s, poOver.id, 'Urgent winter restock');
+    expect(approved.approval).toEqual({
+      by: 'Krisstoff',
+      at: expect.any(String),
+      amount: 2500,
+      note: 'Urgent winter restock',
+    });
+
+    // Refuses non-Draft
+    A.sendPurchase(s, approved.id);
+    expect(approved.status).toBe('Sent');
+    expect(() => A.approvePurchase(s, approved.id)).toThrow(
+      'Only draft purchase orders can be approved.',
+    );
+
+    assertInvariants(s);
+  });
+
+  it('sendPurchase: refuses when approval is required; works after approval and when limit is 0; refuses date before order date or in future', () => {
+    const { s, supplier, p } = stocked();
+    s.settings.poApprovalLimit = 2000;
+
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 50, cost: 50 }], // 2500
+    });
+
+    // Refuses when approval required
+    expect(() => A.sendPurchase(s, po.id)).toThrow(
+      'Purchase orders over $2,000.00 need approval before sending.',
+    );
+
+    // Refuses invalid sent dates
+    A.approvePurchase(s, po.id);
+    expect(() => A.sendPurchase(s, po.id, A.shift(-1))).toThrow(
+      'Send date must be between the order date and today.',
+    );
+    expect(() => A.sendPurchase(s, po.id, A.shift(1))).toThrow(
+      'Send date must be between the order date and today.',
+    );
+
+    // Works after approval
+    const sent = A.sendPurchase(s, po.id, A.today());
+    expect(sent.status).toBe('Sent');
+    expect(sent.sentAt).toBe(A.today());
+    expect(sent.sentBy).toBe('Krisstoff');
+
+    // Works without approval when limit is 0
+    A.setPurchaseSettings(s, { poApprovalLimit: 0 });
+    expect(s.settings.poApprovalLimit).toBe(0);
+    const poNoLimit = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 100, cost: 50 }], // 5000
+    });
+    const sentNoLimit = A.sendPurchase(s, poNoLimit.id);
+    expect(sentNoLimit.status).toBe('Sent');
+
+    assertInvariants(s);
+  });
+
+  it('savePurchase: edits Draft and Sent POs, recomputes total, refuses supplier change on Sent PO, re-requires approval when raised above approved amount, keeps approval when lowered', () => {
+    const { s, supplier, p } = stocked();
+    const otherSupplier = A.saveContact(s, {
+      name: 'Other Supplier',
+      type: 'Supplier',
+      person: '',
+      email: '',
+      phone: '',
+      address: '',
+    });
+    s.settings.poApprovalLimit = 2000;
+
+    // Edits Draft PO
+    const draft = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 10, cost: 50 }], // 500
+    });
+    const editedDraft = A.savePurchase(
+      s,
+      {
+        supplierId: otherSupplier.id,
+        warehouseId: 'wh_branch',
+        date: draft.date,
+        expected: A.shift(5),
+        lines: [{ productId: p.id, qty: 20, cost: 50 }], // 1000
+        notes: 'Updated notes',
+      },
+      draft.id,
+    );
+    expect(editedDraft.supplierId).toBe(otherSupplier.id);
+    expect(editedDraft.warehouseId).toBe('wh_branch');
+    expect(editedDraft.total).toBe(1000);
+    expect(editedDraft.notes).toBe('Updated notes');
+
+    // Create a PO over limit, approve it, and send it
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 50, cost: 50 }], // 2500
+    });
+    A.approvePurchase(s, po.id, 'Approved for $2500');
+    A.sendPurchase(s, po.id);
+    expect(po.status).toBe('Sent');
+
+    // Refuses supplier change on Sent PO
+    expect(() =>
+      A.savePurchase(
+        s,
+        {
+          supplierId: otherSupplier.id,
+          warehouseId: po.warehouseId,
+          date: po.date,
+          expected: po.expected,
+          lines: po.lines,
+        },
+        po.id,
+      ),
+    ).toThrow(
+      "The supplier can't change after the order was sent. Cancel it and create a new one.",
+    );
+
+    // Lowering total keeps approval and Sent status
+    const lowered = A.savePurchase(
+      s,
+      {
+        supplierId: po.supplierId,
+        warehouseId: po.warehouseId,
+        date: po.date,
+        expected: po.expected,
+        lines: [{ productId: p.id, qty: 45, cost: 50 }], // 2250 <= 2500
+      },
+      po.id,
+    );
+    expect(lowered.status).toBe('Sent');
+    expect(lowered.total).toBe(2250);
+    expect(lowered.approval?.amount).toBe(2500);
+
+    // Raising total above approved amount clears approval and returns to Draft
+    const raised = A.savePurchase(
+      s,
+      {
+        supplierId: po.supplierId,
+        warehouseId: po.warehouseId,
+        date: po.date,
+        expected: po.expected,
+        lines: [{ productId: p.id, qty: 60, cost: 50 }], // 3000 > 2500
+      },
+      po.id,
+    );
+    expect(raised.status).toBe('Draft');
+    expect(raised.total).toBe(3000);
+    expect(raised.approval).toBeUndefined();
+    expect(raised.sentAt).toBeUndefined();
+    expect(raised.sentBy).toBeUndefined();
+
+    assertInvariants(s);
+  });
+
+  it('cancelPurchase needs a reason for a Sent PO, not for a Draft', () => {
+    const { s, supplier, p } = stocked();
+
+    const draft = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 10, cost: 50 }],
+    });
+    // Draft cancels without reason
+    const canceledDraft = A.cancelPurchase(s, draft.id);
+    expect(canceledDraft.status).toBe('Canceled');
+    expect(canceledDraft.cancelReason).toBeUndefined();
+
+    const sent = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 10, cost: 50 }],
+      send: true,
+    });
+    // Sent cancels without reason throws
+    expect(() => A.cancelPurchase(s, sent.id)).toThrow(
+      'Enter a reason for canceling a sent order.',
+    );
+    expect(() => A.cancelPurchase(s, sent.id, '   ')).toThrow(
+      'Enter a reason for canceling a sent order.',
+    );
+
+    // Sent cancels with reason
+    const canceledSent = A.cancelPurchase(s, sent.id, 'Supplier discontinues product');
+    expect(canceledSent.status).toBe('Canceled');
+    expect(canceledSent.cancelReason).toBe('Supplier discontinues product');
+
+    assertInvariants(s);
+  });
+
+  it('receivePurchase refuses a Draft', () => {
+    const { s, supplier, p } = stocked();
+    const draft = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 10, cost: 50 }],
+    });
+    expect(() =>
+      A.receivePurchase(s, draft.id, {
+        lines: [
+          { purchaseLineId: draft.lines[0].id, qty: 10, code: 'LOT-FAIL', expiry: A.shift(200) },
+        ],
+      }),
+    ).toThrow('Send this purchase order before receiving it.');
+
+    assertInvariants(s);
+  });
+
+  it('onOrder counts Draft and Sent lines, and stops counting once received or canceled', () => {
+    const { s, supplier, p } = stocked();
+
+    expect(A.onOrder(s, p.id, 'wh_main')).toBe(0);
+
+    // Draft line counts
+    const draft = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 10, cost: 50 }],
+    });
+    expect(A.onOrder(s, p.id, 'wh_main')).toBe(10);
+
+    // Sent line still counts
+    A.sendPurchase(s, draft.id);
+    expect(A.onOrder(s, p.id, 'wh_main')).toBe(10);
+
+    // Received line stops counting
+    A.receivePurchase(s, draft.id, {
+      lines: [
+        { purchaseLineId: draft.lines[0].id, qty: 10, code: 'LOT-ONORDER', expiry: A.shift(200) },
+      ],
+    });
+    expect(A.onOrder(s, p.id, 'wh_main')).toBe(0);
+
+    // Canceled line stops counting
+    const second = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.today(),
+      expected: A.shift(2),
+      lines: [{ productId: p.id, qty: 15, cost: 50 }],
+    });
+    expect(A.onOrder(s, p.id, 'wh_main')).toBe(15);
+    A.cancelPurchase(s, second.id);
+    expect(A.onOrder(s, p.id, 'wh_main')).toBe(0);
+
+    assertInvariants(s);
+  });
+
+  it('migration: an Ordered PO in a v3 backup becomes Sent with sentAt = date, and invariants hold', () => {
+    const raw = JSON.parse(JSON.stringify(A.seed()));
+    raw.version = 3;
+    delete raw.settings.poApprovalLimit;
+
+    // Simulate an old Ordered PO
+    const targetPo = raw.purchases.find(
+      (p: any) => p.status === 'Sent' && !raw.receipts.some((r: any) => r.purchaseId === p.id),
+    )!;
+    targetPo.status = 'Ordered';
+    delete targetPo.sentAt;
+    delete targetPo.sentBy;
+    delete targetPo.createdAt;
+    delete targetPo.createdBy;
+    delete targetPo.approval;
+
+    const loaded = A.validateBackup(raw);
+    expect(loaded.settings.poApprovalLimit).toBe(2000);
+
+    const migratedPO = loaded.purchases.find((p: any) => p.id === targetPo.id)!;
+    expect(migratedPO.status).toBe('Sent');
+    expect(migratedPO.sentAt).toBe(migratedPO.date);
+    expect(migratedPO.sentBy).toBe(A.CURRENT_USER);
+    expect(migratedPO.createdAt).toBe(`${migratedPO.date}T00:00:00.000Z`);
+    expect(migratedPO.createdBy).toBe(A.CURRENT_USER);
+
+    assertInvariants(loaded);
+  });
+});
+
+describe('partial receiving and supplier bills (spec 003)', () => {
+  it('partial receipt creates a GRN for received lines, PO stays Sent and Partly received, second receipt completes it', () => {
+    const { s, supplier, p } = stocked();
+    const otherProduct = A.saveProduct(s, {
+      ...p,
+      sku: 'TEST-2',
+      name: 'Second product',
+    });
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-5),
+      expected: A.shift(2),
+      lines: [
+        { productId: p.id, qty: 10, cost: 20 },
+        { productId: otherProduct.id, qty: 6, cost: 30 },
+      ],
+      send: true,
+    });
+    const l1 = po.lines[0];
+    const l2 = po.lines[1];
+
+    // First receipt: receive 4 of line 1 only (line 2 receives 0 / skipped)
+    const rc1 = A.receivePurchase(s, po.id, {
+      lines: [{ purchaseLineId: l1.id, qty: 4, code: 'LOT-A1', expiry: A.shift(180) }],
+      reference: 'INV-SUP-001',
+      date: A.shift(-3),
+    });
+
+    expect(rc1.number).toMatch(/^GRN-\d{4,}$/);
+    expect(rc1.purchaseId).toBe(po.id);
+    expect(rc1.lines).toHaveLength(1);
+    expect(rc1.lines[0]).toMatchObject({
+      productId: p.id,
+      qty: 4,
+      price: 20,
+      orderedPrice: 20,
+      purchaseLineId: l1.id,
+      lotCode: 'LOT-A1',
+    });
+    expect(rc1.total).toBe(80);
+    expect(rc1.reference).toBe('INV-SUP-001');
+
+    // PO status stays Sent, but purchaseStatus is Partly received
+    expect(po.status).toBe('Sent');
+    expect(A.purchaseStatus(s, po)).toBe('Partly received');
+    expect(A.receivedQty(s, po, l1.id)).toBe(4);
+    expect(A.receivedQty(s, po, l2.id)).toBe(0);
+    expect(A.openQty(s, po, l1)).toBe(6);
+    expect(A.openQty(s, po, l2)).toBe(6);
+
+    // Second receipt: receive remaining 6 of line 1 and all 6 of line 2
+    const rc2 = A.receivePurchase(s, po.id, {
+      lines: [
+        { purchaseLineId: l1.id, qty: 6, code: 'LOT-A2', expiry: A.shift(200) },
+        { purchaseLineId: l2.id, qty: 6, code: 'LOT-B1', expiry: A.shift(250) },
+      ],
+      reference: 'INV-SUP-002',
+      date: A.shift(-1),
+    });
+
+    expect(rc2.lines).toHaveLength(2);
+    expect(po.status).toBe('Received');
+    expect(A.purchaseStatus(s, po)).toBe('Received');
+    expect(po.received).toBe(A.shift(-1));
+    expect(A.openQty(s, po, l1)).toBe(0);
+    expect(A.openQty(s, po, l2)).toBe(0);
+
+    assertInvariants(s);
+  });
+
+  it('over-receipt throws spec message, and multiple lots exceeding open qty also throw', () => {
+    const { s, supplier, p } = stocked();
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-2),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 5, cost: 15 }],
+      send: true,
+    });
+    const line = po.lines[0];
+
+    // Single line over-receipt
+    expect(() =>
+      A.receivePurchase(s, po.id, {
+        lines: [{ purchaseLineId: line.id, qty: 6, code: 'LOT-1', expiry: A.shift(100) }],
+      }),
+    ).toThrow(
+      `${p.name}: only 5 ${line.unit} still open on this order. Raise the PO quantity first.`,
+    );
+
+    // Two lots on same line together exceeding open qty
+    expect(() =>
+      A.receivePurchase(s, po.id, {
+        lines: [
+          { purchaseLineId: line.id, qty: 3, code: 'LOT-1A', expiry: A.shift(100) },
+          { purchaseLineId: line.id, qty: 3, code: 'LOT-1B', expiry: A.shift(120) },
+        ],
+      }),
+    ).toThrow(
+      `${p.name}: only 5 ${line.unit} still open on this order. Raise the PO quantity first.`,
+    );
+
+    assertInvariants(s);
+  });
+
+  it('records actual price: batch cost, bill total, orderedPrice preservation, and journal payable entry', () => {
+    const { s, supplier, p } = stocked();
+    A.saveProduct(s, { ...p, packs: [{ unit: 'carton', factor: 10, barcode: '' }] }, p.id);
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-2),
+      expected: A.today(),
+      lines: [{ productId: p.id, unit: 'carton', qty: 2, cost: 50 }], // ordered @ $50/carton ($5/box)
+      send: true,
+    });
+    const line = po.lines[0];
+
+    // Receive at actual billed price $55/carton ($5.50/box)
+    const rc = A.receivePurchase(s, po.id, {
+      lines: [
+        { purchaseLineId: line.id, qty: 2, price: 55, code: 'LOT-DIFF', expiry: A.shift(300) },
+      ],
+    });
+
+    expect(rc.total).toBe(110);
+    expect(rc.lines[0].price).toBe(55);
+    expect(rc.lines[0].orderedPrice).toBe(50);
+
+    const batch = s.batches.find((b) => b.id === rc.lines[0].batchId)!;
+    expect(batch.cost).toBe(5.5); // 55 / 10
+    expect(batch.qty).toBe(20);
+
+    // Journal entry payable is at the actual total ($110)
+    const lastJournal = s.journal[0];
+    expect(lastJournal.reference).toBe(rc.number);
+    const payableEntry = lastJournal.entries.find((e) => e.account === 'payable')!;
+    expect(payableEntry.credit).toBe(110);
+
+    assertInvariants(s);
+  });
+
+  it('receives one PO line into two lots, creating two batches and two receipt lines', () => {
+    const { s, supplier, p } = stocked();
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-2),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 10, cost: 10 }],
+      send: true,
+    });
+    const line = po.lines[0];
+
+    const rc = A.receivePurchase(s, po.id, {
+      lines: [
+        { purchaseLineId: line.id, qty: 4, code: 'LOT-SPLIT-1', expiry: A.shift(180) },
+        { purchaseLineId: line.id, qty: 6, code: 'LOT-SPLIT-2', expiry: A.shift(360) },
+      ],
+    });
+
+    expect(rc.lines).toHaveLength(2);
+    expect(rc.lines[0].batchId).not.toBe(rc.lines[1].batchId);
+    expect(rc.lines[0].lotCode).toBe('LOT-SPLIT-1');
+    expect(rc.lines[1].lotCode).toBe('LOT-SPLIT-2');
+    expect(rc.lines[0].qty).toBe(4);
+    expect(rc.lines[1].qty).toBe(6);
+
+    const b1 = s.batches.find((b) => b.id === rc.lines[0].batchId)!;
+    const b2 = s.batches.find((b) => b.id === rc.lines[1].batchId)!;
+    expect(b1.qty).toBe(4);
+    expect(b2.qty).toBe(6);
+    expect(b1.expiry).toBe(A.shift(180));
+    expect(b2.expiry).toBe(A.shift(360));
+
+    assertInvariants(s);
+  });
+
+  it('closeRemaining sets closedQty and Received, requires receipts and reason, and works in receivePurchase', () => {
+    const { s, supplier, p } = stocked();
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-3),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 10, cost: 15 }],
+      send: true,
+    });
+
+    // Refused before any receipt
+    expect(() => A.closeRemaining(s, po.id, 'No stock')).toThrow(
+      'Nothing was received yet. Cancel the order instead.',
+    );
+
+    // Partial receipt of 6 items
+    A.receivePurchase(s, po.id, {
+      lines: [{ purchaseLineId: po.lines[0].id, qty: 6, code: 'LOT-P', expiry: A.shift(180) }],
+      date: A.shift(-1),
+    });
+
+    // Refused without reason
+    expect(() => A.closeRemaining(s, po.id, '')).toThrow(
+      'Enter a reason for closing the rest of the order.',
+    );
+
+    // Close remaining 4 items
+    A.closeRemaining(s, po.id, 'Supplier out of stock');
+    expect(po.status).toBe('Received');
+    expect(A.purchaseStatus(s, po)).toBe('Received');
+    expect(po.closeReason).toBe('Supplier out of stock');
+    expect(po.lines[0].closedQty).toBe(4);
+    expect(A.openQty(s, po, po.lines[0])).toBe(0);
+    expect(po.received).toBe(A.shift(-1));
+
+    // Test combined call: receivePurchase with closeRemaining
+    const po2 = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-2),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 10, cost: 15 }],
+      send: true,
+    });
+    A.receivePurchase(s, po2.id, {
+      lines: [{ purchaseLineId: po2.lines[0].id, qty: 7, code: 'LOT-COMB', expiry: A.shift(200) }],
+      closeRemaining: { reason: 'Rest discontinued' },
+    });
+    expect(po2.status).toBe('Received');
+    expect(po2.closeReason).toBe('Rest discontinued');
+    expect(po2.lines[0].closedQty).toBe(3);
+    expect(A.openQty(s, po2, po2.lines[0])).toBe(0);
+
+    assertInvariants(s);
+  });
+
+  it('cancelPurchase is refused after any goods receipt', () => {
+    const { s, supplier, p } = stocked();
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-2),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 10, cost: 10 }],
+      send: true,
+    });
+    A.receivePurchase(s, po.id, {
+      lines: [{ purchaseLineId: po.lines[0].id, qty: 3, code: 'LOT-C', expiry: A.shift(180) }],
+    });
+    expect(() => A.cancelPurchase(s, po.id, 'Cancel attempt')).toThrow(
+      'Part of this order was already received. Close the remainder instead.',
+    );
+    assertInvariants(s);
+  });
+
+  it('savePurchase after receipt refuses removing received line, changing product/unit, reducing below received qty, and changing warehouse', () => {
+    const { s, supplier, p } = stocked();
+    const otherProduct = A.saveProduct(s, { ...p, sku: 'TEST-P2', name: 'Product 2' });
+    A.saveProduct(s, { ...p, packs: [{ unit: 'carton', factor: 10, barcode: '' }] }, p.id);
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-3),
+      expected: A.today(),
+      lines: [
+        { productId: p.id, qty: 10, cost: 10 },
+        { productId: otherProduct.id, qty: 5, cost: 20 },
+      ],
+      send: true,
+    });
+    const l1 = po.lines[0];
+    const l2 = po.lines[1];
+
+    A.receivePurchase(s, po.id, {
+      lines: [{ purchaseLineId: l1.id, qty: 4, code: 'LOT-SAVE', expiry: A.shift(180) }],
+    });
+
+    // Cannot remove received line
+    expect(() =>
+      A.savePurchase(
+        s,
+        {
+          supplierId: po.supplierId,
+          warehouseId: po.warehouseId,
+          date: po.date,
+          expected: po.expected,
+          lines: [{ productId: otherProduct.id, qty: 5, cost: 20 }],
+        },
+        po.id,
+      ),
+    ).toThrow(`${p.name} was already received and can't be removed.`);
+
+    // Cannot change product of received line
+    expect(() =>
+      A.savePurchase(
+        s,
+        {
+          supplierId: po.supplierId,
+          warehouseId: po.warehouseId,
+          date: po.date,
+          expected: po.expected,
+          lines: [
+            { id: l1.id, productId: otherProduct.id, qty: 10, cost: 10 },
+            { id: l2.id, productId: otherProduct.id, qty: 5, cost: 20 },
+          ],
+        },
+        po.id,
+      ),
+    ).toThrow(`${p.name} was already received; its product and unit can't change.`);
+
+    // Cannot change unit of received line
+    expect(() =>
+      A.savePurchase(
+        s,
+        {
+          supplierId: po.supplierId,
+          warehouseId: po.warehouseId,
+          date: po.date,
+          expected: po.expected,
+          lines: [
+            { id: l1.id, productId: p.id, unit: 'carton', qty: 1, cost: 100 },
+            { id: l2.id, productId: otherProduct.id, qty: 5, cost: 20 },
+          ],
+        },
+        po.id,
+      ),
+    ).toThrow(`${p.name} was already received; its product and unit can't change.`);
+
+    // Cannot reduce qty below received qty (4)
+    expect(() =>
+      A.savePurchase(
+        s,
+        {
+          supplierId: po.supplierId,
+          warehouseId: po.warehouseId,
+          date: po.date,
+          expected: po.expected,
+          lines: [
+            { id: l1.id, productId: p.id, qty: 3, cost: 10 },
+            { id: l2.id, productId: otherProduct.id, qty: 5, cost: 20 },
+          ],
+        },
+        po.id,
+      ),
+    ).toThrow(`${p.name}: quantity can't go below the 4 already received.`);
+
+    // Cannot change warehouse
+    expect(() =>
+      A.savePurchase(
+        s,
+        {
+          supplierId: po.supplierId,
+          warehouseId: 'wh_branch',
+          date: po.date,
+          expected: po.expected,
+          lines: po.lines,
+        },
+        po.id,
+      ),
+    ).toThrow("The warehouse can't change after goods were received.");
+
+    // Editing qty down to received qty sets Received if all lines have openQty === 0
+    A.savePurchase(
+      s,
+      {
+        supplierId: po.supplierId,
+        warehouseId: po.warehouseId,
+        date: po.date,
+        expected: po.expected,
+        lines: [{ id: l1.id, productId: p.id, qty: 4, cost: 10 }], // dropped unreceived l2, lowered l1 to 4
+      },
+      po.id,
+    );
+    expect(po.status).toBe('Received');
+
+    assertInvariants(s);
+  });
+
+  it('receiveStock creates a one-line GRN, and cash path has due = date', () => {
+    const { s, supplier, p } = stocked();
+    const batch = A.receiveStock(s, {
+      productId: p.id,
+      warehouseId: 'wh_main',
+      qty: 8,
+      cost: 5,
+      code: 'DIRECT-CASH',
+      expiry: A.shift(300),
+      supplierId: supplier.id,
+      payment: 'cash',
+      reference: 'INV-CASH-999',
+    });
+
+    const rc = s.receipts.find((r) => r.lines.some((l) => l.batchId === batch.id))!;
+    expect(rc).toBeDefined();
+    expect(rc.number).toMatch(/^GRN-\d{4,}$/);
+    expect(rc.purchaseId).toBeUndefined();
+    expect(rc.lines).toHaveLength(1);
+    expect(rc.lines[0].orderedPrice).toBeUndefined();
+    expect(rc.reference).toBe('INV-CASH-999');
+    expect(rc.due).toBe(A.today());
+    expect(rc.paid).toBe(40);
+    expect(A.billStatus(rc)).toBe('Paid');
+
+    assertInvariants(s);
+  });
+
+  it('payBill works on receipts and refuses more than billBalance', () => {
+    const { s, supplier, p } = stocked();
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-5),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 5, cost: 20 }], // 100
+      send: true,
+    });
+    const rc = A.receivePurchase(s, po.id, {
+      lines: [{ purchaseLineId: po.lines[0].id, qty: 5, code: 'LOT-PAY', expiry: A.shift(180) }],
+      date: A.shift(-3),
+    });
+
+    expect(A.billBalance(rc)).toBe(100);
+    expect(A.billStatus(rc)).toBe('Open');
+
+    // Refuses more than balance
+    expect(() => A.payBill(s, rc.id, 105)).toThrow(
+      'Payment must be positive and cannot exceed the bill balance.',
+    );
+
+    // Partial payment
+    A.payBill(s, rc.id, 40, A.shift(-2));
+    expect(rc.paid).toBe(40);
+    expect(A.billBalance(rc)).toBe(60);
+    expect(A.billStatus(rc)).toBe('Partly paid');
+
+    // Remaining payment
+    A.payBill(s, rc.id, 60, A.today());
+    expect(rc.paid).toBe(100);
+    expect(A.billBalance(rc)).toBe(0);
+    expect(A.billStatus(rc)).toBe('Paid');
+
+    assertInvariants(s);
+  });
+
+  it('lastPurchasePrice returns latest actual receipt price instead of PO price', () => {
+    const { s, supplier, p } = stocked();
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-4),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 5, cost: 12 }],
+      send: true,
+    });
+    const rc = A.receivePurchase(s, po.id, {
+      lines: [
+        {
+          purchaseLineId: po.lines[0].id,
+          qty: 5,
+          price: 14.5,
+          code: 'LOT-ACT',
+          expiry: A.shift(200),
+        },
+      ],
+      date: A.shift(-1),
+    });
+
+    const last = A.lastPurchasePrice(s, supplier.id, p.id, 'box');
+    expect(last).toEqual({
+      price: 14.5,
+      date: A.shift(-1),
+      reference: rc.number,
+    });
+
+    assertInvariants(s);
+  });
+
+  it('onOrder counts only open quantities of Draft and Sent POs', () => {
+    const { s, supplier, p } = stocked();
+    const po = A.createPurchase(s, {
+      supplierId: supplier.id,
+      warehouseId: 'wh_main',
+      date: A.shift(-2),
+      expected: A.today(),
+      lines: [{ productId: p.id, qty: 10, cost: 10 }],
+      send: true,
+    });
+    expect(A.onOrder(s, p.id, 'wh_main')).toBe(10);
+
+    // Partial receipt of 4
+    A.receivePurchase(s, po.id, {
+      lines: [{ purchaseLineId: po.lines[0].id, qty: 4, code: 'LOT-OO1', expiry: A.shift(180) }],
+    });
+    expect(A.onOrder(s, p.id, 'wh_main')).toBe(6);
+
+    // Close remaining 6
+    A.closeRemaining(s, po.id, 'Rest cancelled');
+    expect(A.onOrder(s, p.id, 'wh_main')).toBe(0);
+
+    assertInvariants(s);
+  });
+});
 
 describe('contact type history guard', () => {
   it.each([
@@ -1565,7 +2833,7 @@ describe('delivery migration', () => {
         }) => ({ id: i.id, picks: i.allocations, cost: i.cogs }),
       );
     const migrated = A.migrate(raw);
-    expect(migrated.version).toBe(3);
+    expect(migrated.version).toBe(4);
     expect(A.balances(migrated)).toEqual(before);
     expect(migrated.orders).toEqual(orders);
     expect(migrated.journal).toEqual(journal);
@@ -3170,7 +4438,6 @@ describe('customer accounts', () => {
       {
         ...supplier,
         groupId: 'invalid',
-        paymentTermsDays: -1,
         creditLimit: -1,
         onHold: true,
         holdReason: '',
@@ -3180,7 +4447,7 @@ describe('customer accounts', () => {
     );
     expect(saved).toMatchObject({
       groupId: '',
-      paymentTermsDays: 45,
+      paymentTermsDays: 30,
       creditLimit: null,
       onHold: false,
       holdReason: '',
@@ -3824,6 +5091,7 @@ describe('reorder levels and suggestions', () => {
     expect(A.reorderSuggestions(s)).toEqual([]);
     A.cancelPurchase(s, second.id);
     expect(A.onOrder(s, p.id, 'wh_main')).toBe(20);
+    A.sendPurchase(s, first.id);
     A.receivePurchase(s, first.id, [{ code: 'PO-REORDER', expiry: A.shift(400) }]);
     expect(A.onOrder(s, p.id, 'wh_main')).toBe(0);
     expect(A.reorderSuggestions(s)[0].available).toBe(50);
@@ -4286,10 +5554,15 @@ describe('pharma product fields', () => {
       date: A.today(),
       expected: A.shift(1),
       lines: [{ productId: cold.id, qty: 2 }],
+      send: true,
     });
     expect(() =>
       A.transact(s, (copy) =>
-        A.receivePurchase(copy, po.id, [{ code: 'COLD-PO', expiry: A.shift(100) }]),
+        A.receivePurchase(copy, po.id, {
+          lines: [
+            { purchaseLineId: po.lines[0].id, qty: 2, code: 'COLD-PO', expiry: A.shift(100) },
+          ],
+        }),
       ),
     ).toThrow('Cold medicine must be stored at 2–8°C. Choose a cold-storage warehouse.');
     const coldPo = A.createPurchase(s, {
@@ -4298,8 +5571,13 @@ describe('pharma product fields', () => {
       date: A.today(),
       expected: A.shift(1),
       lines: [{ productId: cold.id, qty: 2 }],
+      send: true,
     });
-    A.receivePurchase(s, coldPo.id, [{ code: 'COLD-PO', expiry: A.shift(100) }]);
+    A.receivePurchase(s, coldPo.id, {
+      lines: [
+        { purchaseLineId: coldPo.lines[0].id, qty: 2, code: 'COLD-PO', expiry: A.shift(100) },
+      ],
+    });
     const coldBatch = s.batches.find((b) => b.productId === cold.id && b.qty > 0)!;
     A.adjustStock(s, {
       batchId: coldBatch.id,
@@ -4700,6 +5978,7 @@ describe('stock counts', () => {
       date: A.today(),
       expected: A.shift(1),
       lines: [{ productId: p.id, qty: 2 }],
+      send: true,
     });
     const count = A.startCount(s, { warehouseId: 'wh_main' });
     const before = structuredClone(s);
@@ -4725,7 +6004,11 @@ describe('stock counts', () => {
             { batchId: late.id, qty: 1, reason: 'count', sourceId: count.id } as AdjustmentInput,
             { sourceId: count.id },
           );
-        return A.receivePurchase(copy, po.id, [{ code: 'PO-COUNT', expiry: A.shift(100) }]);
+        return A.receivePurchase(copy, po.id, {
+          lines: [
+            { purchaseLineId: po.lines[0].id, qty: 1, code: 'PO-COUNT', expiry: A.shift(100) },
+          ],
+        });
       }),
     ).toThrow(
       `Central warehouse is being counted (${count.number}). Post or cancel the count first.`,
@@ -4822,8 +6105,11 @@ describe('stock counts', () => {
       date: A.today(),
       expected: A.shift(1),
       lines: [{ productId: other.id, qty: 2 }],
+      send: true,
     });
-    A.receivePurchase(s, po.id, [{ code: 'BRANCH-PO', expiry: A.shift(100) }]);
+    A.receivePurchase(s, po.id, {
+      lines: [{ purchaseLineId: po.lines[0].id, qty: 2, code: 'BRANCH-PO', expiry: A.shift(100) }],
+    });
     expect(invoice.status).toBe('Issued');
     expect(branch.qty).toBe(16);
     assertInvariants(s);
@@ -5104,15 +6390,24 @@ describe('migration and accounting', () => {
       date: A.today(),
       expected: A.shift(5),
       lines: [{ productId: p.id, qty: 3, cost: 2 }],
+      send: true,
     });
-    A.receivePurchase(s, order.id, [{ code: 'ORDER-LOT', expiry: A.shift(365) }]);
+    const receipt = A.receivePurchase(s, order.id, {
+      lines: [
+        { purchaseLineId: order.lines[0].id, qty: 3, code: 'ORDER-LOT', expiry: A.shift(365) },
+      ],
+    });
     expect(order.status).toBe('Received');
     expect(A.onHand(s, p.id, 'wh_branch')).toBe(3);
     expect(() =>
-      A.receivePurchase(s, order.id, [{ code: 'ORDER-LOT', expiry: A.shift(365) }]),
-    ).toThrow('already received');
-    A.payBill(s, order.id, 6);
-    expect(order.paid).toBe(6);
+      A.receivePurchase(s, order.id, {
+        lines: [
+          { purchaseLineId: order.lines[0].id, qty: 3, code: 'ORDER-LOT', expiry: A.shift(365) },
+        ],
+      }),
+    ).toThrow('Only sent purchase orders can be received.');
+    A.payBill(s, receipt.id, 6);
+    expect(receipt.paid).toBe(6);
     expect(A.validateBackup(s)).toBe(s);
   });
   it('records expenses and write-offs in the corresponding ledger accounts', () => {
@@ -5183,7 +6478,8 @@ describe('stock movement ledger', () => {
       type: 'receipt',
       qty: 7,
       date: A.today(),
-      reference: 'DELIVERY-001',
+      reference: s.receipts[0].number,
+      sourceId: s.receipts[0].id,
       counterpartyId: supplier.id,
       batchId: batch.id,
       productId: p.id,
@@ -5192,6 +6488,7 @@ describe('stock movement ledger', () => {
       unitCost: 2,
       user: CURRENT_USER,
     });
+    expect(s.receipts[0].reference).toBe('DELIVERY-001');
     expect(s.stockMoves.at(-1)!.id).toMatch(/^sm_/);
     expect(new Date(s.stockMoves.at(-1)!.at).toISOString()).toBe(s.stockMoves.at(-1)!.at);
     // Receiving into the same lot appends a move and preserves the old one.
@@ -5207,7 +6504,8 @@ describe('stock movement ledger', () => {
     });
     expect(s.stockMoves.slice(0, -1)).toEqual(before);
     expect(s.stockMoves.at(-1)).toMatchObject({
-      reference: 'DIRECT',
+      reference: s.receipts[0].number,
+      sourceId: s.receipts[0].id,
       counterpartyId: supplier.id,
       qty: 3,
     });
@@ -5225,13 +6523,17 @@ describe('stock movement ledger', () => {
       expected: date,
       lines: [{ productId: p.id, qty: 4, cost: 2 }],
     });
-    A.receivePurchase(s, po.id, [{ code: 'PO-LOT', expiry: A.shift(365) }], date);
+    A.sendPurchase(s, po.id, date);
+    const rc = A.receivePurchase(s, po.id, {
+      lines: [{ purchaseLineId: po.lines[0].id, qty: 4, code: 'PO-LOT', expiry: A.shift(365) }],
+      date,
+    });
     expect(s.stockMoves.at(-1)).toMatchObject({
       type: 'receipt',
       qty: 4,
       date,
-      reference: po.number,
-      sourceId: po.id,
+      reference: rc.number,
+      sourceId: rc.id,
       counterpartyId: supplier.id,
     });
     assertInvariants(s);
@@ -5362,7 +6664,7 @@ describe('stock movement ledger', () => {
     raw.version = 1;
     const backup = structuredClone(raw);
     const s = A.migrate(raw);
-    expect(s.version).toBe(3);
+    expect(s.version).toBe(4);
     expect(s.counters.transfer).toBe(1);
     expect(s.stockMoves).toHaveLength(s.batches.filter((b) => b.qty > 0).length);
     expect(A.movesFor(s, { batchId: batch.id })).toEqual([]);
@@ -5501,8 +6803,11 @@ describe('units of measure', () => {
       date: A.today(),
       expected: A.today(),
       lines: [{ productId: p.id, qty: 3, unit: 'carton', cost: 58.5 }],
+      send: true,
     });
-    A.receivePurchase(s, po.id, [{ code: 'ROUNDING', expiry: A.shift(365) }]);
+    A.receivePurchase(s, po.id, {
+      lines: [{ purchaseLineId: po.lines[0].id, qty: 3, code: 'ROUNDING', expiry: A.shift(365) }],
+    });
     expect(s.batches.find((b) => b.code === 'ROUNDING')).toMatchObject({ qty: 60, cost: 2.93 });
     expect(po.total).toBe(175.5);
     expect(s.journal[0].description).toContain('Purchase rounding');
@@ -5699,6 +7004,7 @@ describe('units of measure', () => {
     expect(inv.lines).toEqual(oldInvoice);
     expect(po.lines).toEqual(oldPurchase);
     A.issueInvoice(s, inv.id);
+    A.sendPurchase(s, po.id);
     A.receivePurchase(s, po.id, [
       { code: 'MIXED', expiry: A.shift(365) },
       { code: 'MIXED', expiry: A.shift(365) },
@@ -6541,5 +7847,83 @@ describe('customer payments and credit', () => {
       ),
     ).toBe(true);
     assertInvariants(s);
+  });
+
+  it('round-trips the seed through v3 back to v4 with all balances, batches, and journal unchanged', () => {
+    const seed = A.seed();
+    // Turn the seed back into v3 shape:
+    const v3: any = JSON.parse(JSON.stringify(seed));
+    v3.version = 3;
+    delete v3.counters.receipt;
+    // Put paid back on received POs from their receipts, remove closeReason, strip id/closedQty from lines
+    for (const po of v3.purchases) {
+      if (po.status === 'Received') {
+        const receipt = seed.receipts.find((r) => r.purchaseId === po.id);
+        po.paid = receipt ? receipt.paid : 0;
+        if (receipt) {
+          po.total = receipt.total;
+          po.lines = receipt.lines.map((l) => ({
+            productId: l.productId,
+            name: l.name,
+            sku: l.sku,
+            unit: l.unit,
+            factor: l.factor,
+            qty: l.qty,
+            price: l.price,
+          }));
+        }
+      } else {
+        po.paid = 0;
+      }
+      delete po.closeReason;
+      for (const line of po.lines) {
+        delete line.id;
+        delete line.closedQty;
+      }
+    }
+    // Drop the receipts that came from Received POs (their bills are in po.paid in v3),
+    // and keep direct receipts or partial receipts as v3 receipts.
+    v3.receipts = seed.receipts
+      .filter(
+        (r) =>
+          !r.purchaseId ||
+          !v3.purchases.some((p: any) => p.id === r.purchaseId && p.status === 'Received'),
+      )
+      .map((r) => ({
+        id: r.id,
+        date: r.date,
+        reference: r.reference,
+        supplierId: r.supplierId,
+        total: r.total,
+        paid: r.paid,
+        warehouseId: r.warehouseId,
+      }));
+
+    const migrated = A.migrate(v3);
+
+    // Prove that the payable balance is unchanged
+    expect(A.balances(migrated).payable.balance).toBe(A.balances(seed).payable.balance);
+
+    // Prove every supplier's open-bill total is unchanged
+    for (const supp of seed.contacts.filter((c) => c.type === 'Supplier')) {
+      const seedBillsTotal = A.sum(A.openBills(seed, supp.id), A.billBalance);
+      const migratedBillsTotal = A.sum(A.openBills(migrated, supp.id), A.billBalance);
+      expect(migratedBillsTotal).toBe(seedBillsTotal);
+    }
+
+    // Prove inventoryValue is unchanged
+    expect(A.inventoryValue(migrated)).toBe(A.inventoryValue(seed));
+
+    // Prove every batch qty is unchanged
+    expect(migrated.batches.map((b) => [b.id, b.qty])).toEqual(
+      seed.batches.map((b) => [b.id, b.qty]),
+    );
+
+    // Prove the journal is unchanged (no journal entries added in migration)
+    expect(migrated.journal).toEqual(v3.journal);
+    expect(migrated.journal).toEqual(seed.journal);
+
+    // Prove invariants hold
+    assertInvariants(migrated);
   });
 });

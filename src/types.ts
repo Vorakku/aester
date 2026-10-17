@@ -171,6 +171,8 @@ export interface Contact {
   onHold: boolean;
   holdReason: string;
   billing: 'per_delivery' | 'monthly';
+  leadTimeDays: number;
+  minOrderValue: number | null;
 }
 export interface CustomerGroup {
   id: string;
@@ -313,6 +315,16 @@ export interface Invoice extends Totals {
   deliveryIds: string[];
   notes: string;
 }
+export interface PurchaseApproval {
+  by: string;
+  at: string;
+  amount: number;
+  note: string;
+}
+export interface PurchaseLine extends Line {
+  id: string;
+  closedQty: number;
+}
 export interface Purchase {
   id: string;
   number: string;
@@ -320,24 +332,44 @@ export interface Purchase {
   warehouseId: string;
   date: string;
   expected: string;
-  lines: Line[];
+  lines: PurchaseLine[];
   total: number;
-  paid: number;
-  status: 'Ordered' | 'Received' | 'Canceled';
+  status: 'Draft' | 'Sent' | 'Received' | 'Canceled';
   notes: string;
+  approval?: PurchaseApproval;
+  sentAt?: string;
+  sentBy?: string;
+  createdAt: string;
+  createdBy: string;
+  cancelReason?: string;
   received?: string;
+  closeReason?: string;
   reference?: string;
+}
+export interface ReceiptLine extends Line {
+  purchaseLineId?: string;
+  orderedPrice?: number;
+  batchId: string;
+  lotCode: string;
+  expiry: string;
 }
 export interface Receipt {
   id: string;
+  number: string;
   date: string;
-  reference: string;
   supplierId: string;
+  warehouseId: string;
+  purchaseId?: string;
+  reference: string;
+  lines: ReceiptLine[];
   total: number;
   paid: number;
-  warehouseId: string;
-  number?: string;
-  received?: string;
+  credited: number;
+  due: string;
+  notes: string;
+  legacy?: true;
+  createdAt: string;
+  createdBy: string;
 }
 export interface Expense {
   id: string;
@@ -379,9 +411,10 @@ export interface Settings {
   invoicePrefix: string;
   taxRate: number;
   expiryWindow: number;
+  poApprovalLimit: number;
 }
 export interface Workspace {
-  version: 3;
+  version: 4;
   createdAt: string;
   settings: Settings;
   counters: {
@@ -396,6 +429,7 @@ export interface Workspace {
     delivery: number;
     creditNote: number;
     payment: number;
+    receipt: number;
   };
   products: Product[];
   batches: Batch[];
@@ -516,12 +550,20 @@ export type ProductInput = Omit<
 type CustomerAccountFields = Fields<Contact, 'groupId' | 'onHold' | 'holdReason' | 'billing'>;
 export type ContactInput = Omit<
   Contact,
-  'id' | 'minShelfLifeDays' | 'paymentTermsDays' | 'creditLimit' | keyof CustomerAccountFields
+  | 'id'
+  | 'minShelfLifeDays'
+  | 'paymentTermsDays'
+  | 'creditLimit'
+  | 'leadTimeDays'
+  | 'minOrderValue'
+  | keyof CustomerAccountFields
 > &
   Partial<CustomerAccountFields> & {
     minShelfLifeDays?: NumericInput | null;
     paymentTermsDays?: NumericInput;
     creditLimit?: NumericInput | null;
+    leadTimeDays?: NumericInput;
+    minOrderValue?: NumericInput | null;
   };
 export interface StockInput {
   productId: string;
@@ -548,13 +590,28 @@ export interface InvoiceInput {
   taxRate?: NumericInput;
   notes?: string;
 }
+export interface PurchaseReceiveLineInput {
+  purchaseLineId: string;
+  qty: NumericInput;
+  price?: NumericInput;
+  code: string;
+  expiry: string;
+}
+export interface PurchaseReceiveInput {
+  date?: string;
+  reference?: string;
+  notes?: string;
+  lines: PurchaseReceiveLineInput[];
+  closeRemaining?: { reason: string };
+}
 export interface PurchaseInput {
   supplierId: string;
   warehouseId: string;
   date: string;
   expected: string;
-  lines: LineInput[];
+  lines: (LineInput & { id?: string })[];
   notes?: string;
+  send?: boolean;
 }
 export type PurchaseInitial = Fields<PurchaseInput, 'supplierId' | 'warehouseId' | 'lines'>;
 export type InvoiceInitial = Fields<InvoiceInput, 'customerId' | 'lines' | 'fromHoldIds'>;

@@ -20,9 +20,7 @@ export function AccountingPage() {
   const b = A.balances(state),
     p = A.balances(state, A.shift(-period + 1));
   const profit = A.round(p.revenue.balance - p.cogs.balance - p.expense.balance - p.loss.balance);
-  const bills = [...state.purchases.filter((p) => p.status === 'Received'), ...state.receipts].sort(
-    (a, b) => b.date.localeCompare(a.date),
-  );
+  const bills = [...state.receipts].sort((a, b) => b.date.localeCompare(a.date));
   return (
     <>
       <Heading
@@ -225,35 +223,44 @@ export function AccountingPage() {
                 </tr>
               </thead>
               <tbody>
-                {bills.map((bill) => (
-                  <tr key={bill.id}>
-                    <td>
-                      <strong>{bill.number || bill.reference}</strong>
-                    </td>
-                    <td>{A.contact(state, bill.supplierId)?.name || 'Direct stock receipt'}</td>
-                    <td>{date(bill.received || bill.date)}</td>
-                    <td>{money(bill.total)}</td>
-                    <td>
-                      <strong>{money(bill.total - bill.paid)}</strong>
-                    </td>
-                    <td>
-                      <Badge status={bill.total === bill.paid ? 'Paid' : 'Due'} />
-                    </td>
-                    <td>
-                      {bill.total > bill.paid ? (
-                        <Button
-                          tone="small"
-                          icon="wallet"
-                          onClick={() => open('bill-payment', bill.id)}
+                {bills.map((bill) => {
+                  const balance = A.billBalance(bill);
+                  const status = A.billStatus(bill);
+                  return (
+                    <tr key={bill.id}>
+                      <td>
+                        <button
+                          className="table-link mono font-semibold"
+                          onClick={() => open('receipt-detail', bill.id)}
                         >
-                          Pay bill
-                        </Button>
-                      ) : (
-                        '—'
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                          {bill.number}
+                        </button>
+                      </td>
+                      <td>{A.contact(state, bill.supplierId)?.name || 'Direct stock receipt'}</td>
+                      <td>{date(bill.date)}</td>
+                      <td>{money(bill.total)}</td>
+                      <td>
+                        <strong>{money(balance)}</strong>
+                      </td>
+                      <td>
+                        <Badge status={status} />
+                      </td>
+                      <td>
+                        {balance > 0 ? (
+                          <Button
+                            tone="small"
+                            icon="wallet"
+                            onClick={() => open('bill-payment', bill.id)}
+                          >
+                            Pay bill
+                          </Button>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
                 {!bills.length && (
                   <tr>
                     <td colSpan={7}>

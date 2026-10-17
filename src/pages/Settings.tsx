@@ -111,6 +111,9 @@ export function SettingsPage() {
                     defaultPaymentTermsDays: data.defaultPaymentTermsDays,
                     overdueGraceDays: data.overdueGraceDays,
                   });
+                  A.setPurchaseSettings(draft, {
+                    poApprovalLimit: data.poApprovalLimit,
+                  });
                   const taxRate = Number(data.taxRate),
                     expiryWindow = Number(data.expiryWindow),
                     invoicePrefix = String(data.invoicePrefix || '')
@@ -161,6 +164,15 @@ export function SettingsPage() {
                   max="365"
                   step="1"
                   required
+                />
+                <Field
+                  label="Purchase approval limit ($)"
+                  name="poApprovalLimit"
+                  type="number"
+                  defaultValue={s.poApprovalLimit}
+                  min="0"
+                  step="0.01"
+                  hint="0 turns approval off."
                 />
                 <Field
                   label="Default invoice tax (%)"

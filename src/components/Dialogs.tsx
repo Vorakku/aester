@@ -11,6 +11,7 @@ import {
   ContactForm,
   ContactHoldForm,
   AdjustmentForm,
+  CloseRemainderForm,
   ExpenseForm,
   PaymentForm,
   ProductForm,
@@ -25,6 +26,7 @@ import {
   InvoiceDetail,
   ProductDetail,
   PurchaseDetail,
+  ReceiptDetail,
 } from './details';
 import { HelpContent } from '../pages/Settings';
 import { MovementTable } from '../pages/Operations';
@@ -259,11 +261,17 @@ function DialogContents({ dialog }: { dialog: Dialog }) {
     'payment-detail': <PaymentDetail id={id} />,
     'refund-credit': <RefundCreditForm id={id} />,
     'bill-payment': <PaymentForm id={id} bill />,
+    'receipt-detail': <ReceiptDetail id={id} />,
     'purchase-form': (
-      <TransactionForm purchase initial={'initial' in dialog ? dialog.initial : undefined} />
+      <TransactionForm
+        purchase
+        id={id || undefined}
+        initial={'initial' in dialog ? dialog.initial : undefined}
+      />
     ),
     'purchase-detail': <PurchaseDetail id={id} />,
     'purchase-receive': <PurchaseReceiveForm id={id} />,
+    'close-remainder': <CloseRemainderForm id={id} />,
     'expense-form': <ExpenseForm />,
     'contact-form': <ContactForm id={id || undefined} />,
     'customer-statement': (
@@ -374,7 +382,14 @@ export function DialogHost() {
     'refund-credit': ['Refund credit', 'Return available credit to the customer.'],
     'invoice-payment': ['Record a payment', 'Keep your customer balances up to date.'],
     'bill-payment': ['Pay supplier bill', 'Record a payment against the outstanding balance.'],
-    'purchase-form': ['New purchase order', 'Plan incoming stock and track its delivery.'],
+    'receipt-detail': [
+      state.receipts.find((r) => r.id === id)?.number || 'Goods receipt',
+      'Supplier bill and batch traceability.',
+    ],
+    'purchase-form': [
+      id ? 'Edit purchase order' : 'New purchase order',
+      'Plan incoming stock and track its delivery.',
+    ],
     'purchase-detail': [
       state.purchases.find((p) => p.id === id)?.number || 'Purchase order',
       'Track delivery and supplier payments.',
@@ -382,6 +397,10 @@ export function DialogHost() {
     'purchase-receive': [
       `Receive ${state.purchases.find((p) => p.id === id)?.number || 'purchase order'}`,
       'Confirm the actual lot number and expiry of every product.',
+    ],
+    'close-remainder': [
+      'Close order remainder',
+      'Close outstanding quantities on this purchase order.',
     ],
     'expense-form': ['Record an expense', 'Keep the costs of your operation in the picture.'],
     'contact-form': [
@@ -424,6 +443,7 @@ export function DialogHost() {
     'purchase-form',
     'purchase-detail',
     'purchase-receive',
+    'receipt-detail',
     'activity',
     'help',
     'count-sheet',

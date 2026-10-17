@@ -619,11 +619,11 @@ test('reorder levels turn a reviewed supplier group into a PO and remove its sug
   await expect(form.getByLabel('Supplier', { exact: false })).not.toHaveValue('');
   await expect(form.getByLabel('Line product', { exact: true })).toHaveCount(products.length);
   await expect(form.getByLabel('Line unit').first()).toHaveValue('carton');
-  await form.getByRole('button', { name: 'Create purchase order', exact: true }).click();
+  await form.getByRole('button', { name: 'Save draft', exact: true }).click();
   await expect(form).not.toBeVisible();
   await expect(page.getByRole('region', { name: groupLabel!, exact: true })).toHaveCount(0);
   const state = await saved(page);
-  expect(state.purchases[0]).toMatchObject({ status: 'Ordered', warehouseId: 'wh_branch' });
+  expect(state.purchases[0]).toMatchObject({ status: 'Draft', warehouseId: 'wh_branch' });
   expect(state.purchases[0].lines.map((l: { name: string }) => l.name)).toEqual(products);
 });
 
@@ -1113,7 +1113,7 @@ test('packaging, carton receipts, barcode sales, and mixed purchase units stay c
   await page.getByLabel('Scan barcode').fill('PACK-BASE');
   await page.getByLabel('Scan barcode').press('Enter');
   await page.getByLabel('Line quantity', { exact: true }).nth(1).fill('5');
-  await page.getByRole('button', { name: 'Create purchase order', exact: true }).click();
+  await page.getByRole('button', { name: 'Save & send', exact: true }).click();
   await page
     .locator('tbody tr')
     .first()
@@ -1124,7 +1124,7 @@ test('packaging, carton receipts, barcode sales, and mixed purchase units stay c
   await page.getByLabel('Actual batch / lot number').nth(1).fill('PACK-PO-BOX');
   await page.getByLabel('Actual expiry date').nth(0).fill('2030-12-31');
   await page.getByLabel('Actual expiry date').nth(1).fill('2030-12-31');
-  await page.getByRole('button', { name: 'Receive all items', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Receive', exact: true }).click();
   state = await saved(page);
   expect(state.purchases[0].status).toBe('Received');
   expect(
@@ -1181,7 +1181,7 @@ test('stock ledger connects receipts, lot history, past stock, and filtered CSV'
   expect(move).toMatchObject({
     type: 'receipt',
     qty: 25,
-    reference: 'LEDGER-LOT',
+    reference: expect.stringMatching(/^GRN-/),
     counterpartyId: 's1',
     user: 'Krisstoff',
   });
@@ -1320,7 +1320,7 @@ test('stock, invoices, payments, purchases, expenses, search, and backups remain
   await page.getByRole('dialog').getByLabel('Supplier', { exact: false }).selectOption('s1');
   await page.getByLabel('Line product', { exact: true }).selectOption(product.id);
   await page.getByLabel('Line quantity', { exact: true }).fill('4');
-  await page.getByRole('button', { name: 'Create purchase order', exact: true }).click();
+  await page.getByRole('button', { name: 'Save & send', exact: true }).click();
   await page
     .locator('tbody tr')
     .first()
@@ -1328,7 +1328,7 @@ test('stock, invoices, payments, purchases, expenses, search, and backups remain
     .click();
   await page.getByLabel('Actual batch / lot number').fill('REACT-ORDER');
   await page.getByLabel('Actual expiry date').fill('2030-12-31');
-  await page.getByRole('button', { name: 'Receive all items', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Receive', exact: true }).click();
   state = await saved(page);
   expect(state.purchases[0].status).toBe('Received');
   expect(state.batches.find((b: { code: string }) => b.code === 'REACT-ORDER').qty).toBe(4);
@@ -1481,4 +1481,217 @@ test('one customer payment settles two invoices, keeps extra credit and applies 
   expect(payment.allocations[2].amount).toBe(extra);
   await page.reload();
   expect((await saved(page)).invoices[0].paid).toBe(extra);
+});
+
+test('supplier lead time, last purchase price hint, and minimum order warning in PO form', async ({
+  page,
+}) => {
+  await page.goto('/#contacts');
+  const dialog = page.getByRole('dialog');
+  await page.getByRole('button', { name: 'Edit BioHealth Pharma' }).click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel('Lead time (days)').fill('7');
+  await dialog.getByLabel('Minimum order ($, optional)').fill('600');
+  await dialog.getByRole('button', { name: 'Save contact', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+
+  const savedSupplier = (await saved(page)).contacts.find((c: { id: string }) => c.id === 's2');
+  expect(savedSupplier.leadTimeDays).toBe(7);
+  expect(savedSupplier.minOrderValue).toBe(600);
+
+  await page.goto('/#purchasing');
+  await page.getByRole('button', { name: 'New purchase order', exact: true }).click();
+  await expect(dialog).toBeVisible();
+
+  await dialog.getByLabel('Supplier', { exact: false }).selectOption('s2');
+
+  const today = new Date();
+  const shifted = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 7);
+  const expectedDate = `${shifted.getFullYear()}-${String(shifted.getMonth() + 1).padStart(2, '0')}-${String(shifted.getDate()).padStart(2, '0')}`;
+  await expect(dialog.getByLabel('Expected delivery')).toHaveValue(expectedDate);
+
+  await dialog.getByLabel('Line product', { exact: true }).selectOption('p2');
+  await expect(dialog.getByLabel('Line unit cost', { exact: true })).toHaveValue('8.2');
+  await expect(dialog.getByText(/Last paid \$8\.20 on .* \((PO-0209|GRN-\d+)\)/)).toBeVisible();
+  await expect(
+    dialog.getByText("BioHealth Pharma's minimum order is $600.00. This order is $8.20."),
+  ).toBeVisible();
+
+  const submit = dialog.getByRole('button', { name: 'Save draft', exact: true });
+  await expect(submit).toBeEnabled();
+  await submit.click();
+  await expect(dialog).not.toBeVisible();
+
+  const po = (await saved(page)).purchases[0];
+  expect(po.supplierId).toBe('s2');
+  expect(po.expected).toBe(expectedDate);
+  expect(po.total).toBe(8.2);
+});
+
+test('purchase order approval workflow and print layout (spec 002)', async ({ page }) => {
+  await page.goto('/#purchasing');
+  await page.getByRole('button', { name: 'New purchase order', exact: true }).click();
+  const form = page.getByRole('dialog');
+  await expect(form).toBeVisible();
+
+  // Select supplier MediCore Distribution (s1)
+  await form.getByLabel('Supplier', { exact: false }).selectOption('s1');
+  // Select product Paracetamol 500mg (p1)
+  await form.getByLabel('Line product', { exact: true }).selectOption('p1');
+  // Fill unit cost 50 and qty 50 -> subtotal 2500 > 2000 approval limit
+  await form.getByLabel('Line unit cost', { exact: true }).fill('50');
+  await form.getByLabel('Line quantity', { exact: true }).fill('50');
+
+  // Verify callout appears: "Orders over $2,000.00 need approval before they're sent."
+  await expect(
+    form.getByText("Orders over $2,000.00 need approval before they're sent."),
+  ).toBeVisible();
+
+  // Verify "Save & send" button is disabled
+  const saveAndSend = form.getByRole('button', { name: 'Save & send', exact: true });
+  await expect(saveAndSend).toBeDisabled();
+
+  // Save draft
+  await form.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(form).not.toBeVisible();
+
+  // Find the newly created PO in the Purchasing table
+  const newRow = page.locator('tbody tr').filter({ hasText: '$2,500.00' }).first();
+  await expect(newRow).toBeVisible();
+  await expect(newRow.getByText('Draft')).toBeVisible();
+  await expect(newRow.getByText('Needs approval')).toBeVisible();
+
+  // Open detail dialog
+  await newRow.locator('.table-link').first().click();
+  const detail = page.getByRole('dialog');
+  await expect(detail).toBeVisible();
+  await expect(detail.locator('.badge').filter({ hasText: 'Draft' }).first()).toBeVisible();
+  await expect(
+    detail.locator('.badge').filter({ hasText: 'Needs approval' }).first(),
+  ).toBeVisible();
+
+  // Approve the PO with optional note
+  await detail.getByRole('button', { name: 'Approve', exact: true }).click();
+  await detail.getByLabel('Approval note (optional)').fill('Approved for quarterly stock');
+  await detail.getByRole('button', { name: 'Confirm approval', exact: true }).click();
+
+  // Approval record should be displayed
+  await expect(
+    detail.getByText(/Approved by Krisstoff on .*Approved for quarterly stock/).first(),
+  ).toBeVisible();
+
+  // Send the PO
+  await detail.getByRole('button', { name: 'Send', exact: true }).click();
+
+  // PO is now Sent
+  await expect(detail.locator('.badge').filter({ hasText: 'Sent' }).first()).toBeVisible();
+
+  // Print / PDF button is visible
+  await expect(detail.getByRole('button', { name: 'Print / PDF', exact: true })).toBeVisible();
+});
+
+test('partial receiving, changed price, multiple lots, and remainder completion (spec 003)', async ({
+  page,
+}) => {
+  await page.goto('/#purchasing');
+  await page.getByRole('button', { name: 'New purchase order', exact: true }).click();
+  const form = page.getByRole('dialog');
+  await expect(form).toBeVisible();
+
+  // Create PO with 2 lines: p1 (qty 10, cost $2) and p2 (qty 20, cost $3)
+  await form.getByLabel('Supplier', { exact: false }).selectOption('s1');
+  await form.getByLabel('Line product', { exact: true }).nth(0).selectOption('p1');
+  await form.getByLabel('Line quantity', { exact: true }).nth(0).fill('10');
+  await form.getByLabel('Line unit cost', { exact: true }).nth(0).fill('2.00');
+
+  await form.getByRole('button', { name: 'Add another product', exact: true }).click();
+  await form.getByLabel('Line product', { exact: true }).nth(1).selectOption('p2');
+  await form.getByLabel('Line quantity', { exact: true }).nth(1).fill('20');
+  await form.getByLabel('Line unit cost', { exact: true }).nth(1).fill('3.00');
+
+  await form.getByRole('button', { name: 'Save & send', exact: true }).click();
+  await expect(form).not.toBeVisible();
+
+  // Find the PO row in Purchasing table
+  const poRow = page.locator('tbody tr').filter({ hasText: 'MediCore Distribution' }).first();
+  await expect(poRow).toBeVisible();
+  await expect(poRow.locator('.badge').filter({ hasText: 'Sent' })).toBeVisible();
+
+  // Open Receive form
+  await poRow.getByRole('button', { name: 'Receive', exact: true }).click();
+  const receiveDialog = page.getByRole('dialog');
+  await expect(receiveDialog).toBeVisible();
+
+  await receiveDialog.getByLabel('Supplier invoice / delivery note no.').fill('INV-TEST-003');
+
+  // Change actual price on line 1 from 2.00 to 2.40 (should show +$0.40 vs PO)
+  await receiveDialog.getByLabel('Actual cost per box ($)').nth(0).fill('2.40');
+  await expect(receiveDialog.getByText('+$0.40 vs PO')).toBeVisible();
+
+  // Split lot on line 1
+  await receiveDialog.getByRole('button', { name: 'Split lot', exact: true }).nth(0).click();
+
+  // Line 1 now has two lots: receive 4 in first lot, 3 in second lot (7 total of 10)
+  await receiveDialog.getByLabel('Receive now (boxes)').nth(0).fill('4');
+  await receiveDialog.getByLabel('Actual batch / lot number').nth(0).fill('LOT-1A');
+  await receiveDialog.getByLabel('Actual expiry date').nth(0).fill('2030-12-31');
+
+  await receiveDialog.getByLabel('Receive now (boxes)').nth(1).fill('3');
+  await receiveDialog.getByLabel('Actual batch / lot number').nth(1).fill('LOT-1B');
+  await receiveDialog.getByLabel('Actual expiry date').nth(1).fill('2031-06-30');
+
+  // Line 2: receive 0 for now (skip line)
+  await receiveDialog
+    .getByLabel(/Receive now/)
+    .nth(2)
+    .fill('0');
+
+  // Footer summary should be present
+  await expect(receiveDialog.getByText(/Bill total .* ordered value .* difference/)).toBeVisible();
+
+  // Submit partial receive
+  await receiveDialog.getByRole('button', { name: 'Receive', exact: true }).click();
+  await expect(receiveDialog).not.toBeVisible();
+
+  // PO now shows 'Partly received'
+  await expect(
+    page.locator('tbody tr').filter({ hasText: 'Partly received' }).first(),
+  ).toBeVisible();
+
+  // Check Receipts & bills tab
+  await page.getByRole('button', { name: 'Receipts & bills', exact: true }).click();
+  const grnRow = page.locator('tbody tr').filter({ hasText: 'INV-TEST-003' }).first();
+  await expect(grnRow).toBeVisible();
+
+  // Open receipt detail
+  await grnRow.locator('.table-link').first().click();
+  const receiptModal = page.getByRole('dialog');
+  await expect(receiptModal).toBeVisible();
+  await expect(receiptModal.getByText('+$0.40')).toBeVisible();
+  await receiptModal.getByRole('button', { name: 'Close dialog', exact: true }).click();
+  await expect(receiptModal).not.toBeVisible();
+
+  // Switch back to Purchase orders tab and receive remainder
+  await page.getByRole('button', { name: 'Purchase orders', exact: true }).click();
+  const partlyRow = page.locator('tbody tr').filter({ hasText: 'Partly received' }).first();
+  await partlyRow.getByRole('button', { name: 'Receive', exact: true }).click();
+  await expect(receiveDialog).toBeVisible();
+
+  // Remaining open quantities should default in: 3 for line 1, 20 for line 2
+  await receiveDialog.getByLabel('Actual batch / lot number').nth(0).fill('LOT-1C');
+  await receiveDialog.getByLabel('Actual expiry date').nth(0).fill('2030-12-31');
+
+  await receiveDialog.getByLabel('Actual batch / lot number').nth(1).fill('LOT-2A');
+  await receiveDialog.getByLabel('Actual expiry date').nth(1).fill('2030-12-31');
+
+  await receiveDialog.getByRole('button', { name: 'Receive', exact: true }).click();
+  await expect(receiveDialog).not.toBeVisible();
+
+  // PO is now fully Received
+  const finishedState = await saved(page);
+  const finishedPo = finishedState.purchases[0];
+  expect(finishedPo.status).toBe('Received');
+  await expect(
+    page.locator('tbody tr').filter({ hasText: finishedPo.number }).first().getByText('Received'),
+  ).toBeVisible();
 });

@@ -19,6 +19,11 @@ import type {
   PriceEntry,
   Invoice,
   Purchase,
+  PurchaseLine,
+  PurchaseApproval,
+  Receipt,
+  ReceiptLine,
+  PurchaseReceiveInput,
   Batch,
   Workspace,
   LineInput,
@@ -142,7 +147,9 @@ function inactiveReason(s: Workspace, id: string): string {
   required(p, 'Product not found.');
   return onHand(s, id) > 0 ||
     s.invoices.some((i) => i.status === 'Draft' && i.lines.some((l) => l.productId === id)) ||
-    s.purchases.some((p) => p.status === 'Ordered' && p.lines.some((l) => l.productId === id)) ||
+    s.purchases.some(
+      (p) => ['Draft', 'Sent'].includes(p.status) && p.lines.some((l) => l.productId === id),
+    ) ||
     s.orders.some(
       (o) =>
         ['Quote', 'Confirmed'].includes(o.status) &&
@@ -254,7 +261,10 @@ const contact = (s: Workspace, id: string) => s.contacts.find((x) => x.id === id
 const warehouse = (s: Workspace, id: string) => s.warehouses.find((x) => x.id === id);
 const baseUnitLocked = (s: Workspace, id: string) =>
   s.batches.some((b) => b.productId === id) ||
-  [...s.invoices, ...s.purchases, ...s.orders].some((d) => d.lines.some((l) => l.productId === id));
+  [...s.invoices, ...s.purchases, ...s.orders].some((d) =>
+    d.lines.some((l) => l.productId === id),
+  ) ||
+  s.receipts.some((r) => r.lines.some((l) => l.productId === id));
 const unitLabel = (unit: Unit, qty = 2) =>
   qty === 1 ? unit : unit === 'box' ? 'boxes' : unit + 's';
 function unitFactor(p: Product, unit: Unit = p.unit): number {
@@ -843,15 +853,83 @@ function deleteReorderRule(s: Workspace, productId: string, warehouseId: string)
     (r) => r.productId !== productId || r.warehouseId !== warehouseId,
   );
 }
+
+function receivedQty(s: Workspace, po: Purchase, lineOrId: string | PurchaseLine): number {
+  const lineId = typeof lineOrId === 'string' ? lineOrId : lineOrId.id;
+  return sum(
+    s.receipts
+      .filter((r) => r.purchaseId === po.id)
+      .flatMap((r) => r.lines)
+      .filter((l) => l.purchaseLineId === lineId),
+    (l) => l.qty,
+  );
+}
+
+function deliveredQty(s: Workspace, order: SalesOrder, lineId: string): number {
+  return s.deliveries
+    .filter((d) => d.orderId === order.id && ['Dispatched', 'Delivered'].includes(d.status))
+    .flatMap((d) => d.lines)
+    .filter((l) => l.orderLineId === lineId)
+    .reduce((n, l) => n + l.qty, 0);
+}
+
+function openQty(s: Workspace, doc: any, lineOrId: any): number {
+  if ('supplierId' in doc) {
+    const line =
+      typeof lineOrId === 'string'
+        ? doc.lines.find((l: any) => l.id === lineOrId)
+        : (lineOrId as PurchaseLine);
+    if (!line) return 0;
+    return Math.max(0, line.qty - receivedQty(s, doc, line.id) - (line.closedQty || 0));
+  } else {
+    const lineId = typeof lineOrId === 'string' ? lineOrId : lineOrId.id;
+    const line = doc.lines.find((l: any) => l.id === lineId);
+    required(line, 'Order line not found.');
+    return Math.max(0, line.qty - line.cancelledQty - deliveredQty(s, doc, lineId));
+  }
+}
+
+function purchaseStatus(
+  s: Workspace,
+  po: Purchase,
+): 'Draft' | 'Sent' | 'Partly received' | 'Received' | 'Canceled' {
+  if (po.status === 'Sent' && po.lines.some((l) => receivedQty(s, po, l.id) > 0)) {
+    return 'Partly received';
+  }
+  return po.status;
+}
+
+function billBalance(r: Receipt): number {
+  return round(r.total - r.paid - r.credited);
+}
+
+function billStatus(r: Receipt): 'Paid' | 'Overdue' | 'Partly paid' | 'Open' {
+  if (billBalance(r) === 0) return 'Paid';
+  if (r.due < today()) return 'Overdue';
+  if (r.paid + r.credited > 0) return 'Partly paid';
+  return 'Open';
+}
+
+function openBills(s: Workspace, supplierId?: string): Receipt[] {
+  return s.receipts
+    .filter((r) => (!supplierId || r.supplierId === supplierId) && billBalance(r) > 0)
+    .sort(
+      (a, b) =>
+        a.due.localeCompare(b.due) ||
+        a.number.localeCompare(b.number, undefined, { numeric: true }) ||
+        a.number.localeCompare(b.number),
+    );
+}
+
 function onOrder(s: Workspace, productId: string, warehouseId: string): number {
   return s.purchases
-    .filter((p) => p.status === 'Ordered' && p.warehouseId === warehouseId)
+    .filter((p) => ['Draft', 'Sent'].includes(p.status) && p.warehouseId === warehouseId)
     .reduce(
       (n, p) =>
         n +
         p.lines
           .filter((l) => l.productId === productId)
-          .reduce((qty, l) => qty + l.qty * l.factor, 0),
+          .reduce((qty, l) => qty + openQty(s, p, l) * l.factor, 0),
       0,
     );
 }
@@ -881,7 +959,9 @@ function reorderSuggestions(s: Workspace, warehouseId?: string): Suggestion[] {
           orderBase: orderQty * factor,
           orderUnit,
           orderQty,
-          estimatedCost: round(orderQty * unitPrice(p, orderUnit, true)),
+          estimatedCost: round(
+            orderQty * purchaseLinePrice(s, p.supplierId || '', p.id, orderUnit),
+          ),
         },
       ];
     });
@@ -1332,31 +1412,60 @@ function receiveStock(s: Workspace, data: StockInput) {
     qty = qtyCheck(data.qty),
     cost = moneyCheck(data.cost, 'Unit cost'),
     amount = round(qty * cost);
+  const supplierId = data.supplierId || p.supplierId;
+  const supplier = contact(s, supplierId);
+  const date = today();
+  const receiptNumber = `GRN-${String(s.counters.receipt++).padStart(4, '0')}`;
+  const receiptId = uid('receipt');
+
   const batch = addBatch(
     s,
-    { ...data, qty: qty * factor, cost: round(cost / factor) },
+    { ...data, qty: qty * factor, cost: round(cost / factor), received: date },
     {
-      date: today(),
-      reference: data.reference,
-      counterpartyId: data.supplierId || product(s, data.productId)?.supplierId,
+      date,
+      reference: receiptNumber,
+      sourceId: receiptId,
+      counterpartyId: supplierId,
     },
   );
   const inventoryDebit = round(qty * factor * batch.cost);
   ledger(
     s,
-    today(),
-    data.reference || batch.code,
+    date,
+    receiptNumber,
     'Stock receipt — ' + p.name + (amount !== inventoryDebit ? ' · Purchase rounding' : ''),
     purchaseEntries(inventoryDebit, amount, data.payment === 'credit' ? 'payable' : 'cash'),
   );
-  const receipt = {
-    id: uid('receipt'),
-    date: today(),
-    reference: batch.code,
-    supplierId: data.supplierId || product(s, data.productId)!.supplierId,
+  const due = data.payment === 'cash' ? date : shift(supplier?.paymentTermsDays ?? 30, date);
+
+  const line: ReceiptLine = {
+    productId: p.id,
+    name: p.name,
+    sku: p.sku,
+    unit: data.unit ?? p.unit,
+    factor,
+    qty,
+    price: cost,
+    batchId: batch.id,
+    lotCode: batch.code,
+    expiry: batch.expiry,
+  };
+
+  const receipt: Receipt = {
+    id: receiptId,
+    number: receiptNumber,
+    date,
+    reference: String(data.reference || '').trim(),
+    supplierId,
+    warehouseId: data.warehouseId,
+    lines: [line],
     total: amount,
     paid: data.payment === 'credit' ? 0 : amount,
-    warehouseId: data.warehouseId,
+    credited: 0,
+    due,
+    notes: '',
+    createdAt: new Date().toISOString(),
+    createdBy: CURRENT_USER,
   };
   s.receipts.unshift(receipt);
   activity(
@@ -1791,18 +1900,6 @@ function invoicedQty(s: Workspace, order: SalesOrder, lineId: string): number {
       (n, d) => n + d.lines.filter((l) => l.orderLineId === lineId).reduce((v, l) => v + l.qty, 0),
       0,
     );
-}
-function deliveredQty(s: Workspace, order: SalesOrder, lineId: string): number {
-  return s.deliveries
-    .filter((d) => d.orderId === order.id && ['Dispatched', 'Delivered'].includes(d.status))
-    .flatMap((d) => d.lines)
-    .filter((l) => l.orderLineId === lineId)
-    .reduce((n, l) => n + l.qty, 0);
-}
-function openQty(s: Workspace, order: SalesOrder, lineId: string): number {
-  const line = order.lines.find((l) => l.id === lineId);
-  required(line, 'Order line not found.');
-  return line.qty - line.cancelledQty - deliveredQty(s, order, lineId);
 }
 function orderTotals(order: SalesOrder) {
   const lines = order.lines.map((l) => ({ ...l, qty: l.qty - l.cancelledQty }));
@@ -3211,13 +3308,96 @@ function deleteDraft(s: Workspace, id: string) {
   releaseInvoiceReservations(s, id);
   s.invoices = s.invoices.filter((i) => i.id !== id);
 }
-function createPurchase(s: Workspace, data: PurchaseInput) {
+function lastPurchasePrice(
+  s: Workspace,
+  supplierId: string,
+  productId: string,
+  unit: Unit,
+): { price: number; date: string; reference: string } | null {
+  const receipts = s.receipts
+    .filter((r) => r.supplierId === supplierId && r.purchaseId)
+    .sort(
+      (a, b) =>
+        b.date.localeCompare(a.date) ||
+        b.number.localeCompare(a.number, undefined, { numeric: true }) ||
+        b.number.localeCompare(a.number),
+    );
+  for (const r of receipts) {
+    const line = r.lines.find((l) => l.productId === productId && l.unit === unit);
+    if (line) {
+      return { price: line.price, date: r.date, reference: r.number };
+    }
+  }
+  return null;
+}
+function purchaseLinePrice(
+  s: Workspace,
+  supplierId: string,
+  productId: string,
+  unit: Unit,
+): number {
+  const p = product(s, productId);
+  required(p, 'Select a product.');
+  const last = lastPurchasePrice(s, supplierId, productId, unit);
+  return last?.price ?? unitPrice(p, unit, true);
+}
+function expectedDate(s: Workspace, supplierId: string, orderDate = today()): string {
+  const c = contact(s, supplierId);
+  return shift(c?.leadTimeDays ?? 0, orderDate);
+}
+function belowMinimumOrder(s: Workspace, supplierId: string, total: NumericInput): number | null {
+  const c = contact(s, supplierId);
+  if (!c || c.minOrderValue === null) return null;
+  const t = Number(total);
+  return t < c.minOrderValue ? c.minOrderValue : null;
+}
+const formatLimit = (limit: number) =>
+  new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(limit);
+
+function approvalRequired(
+  s: Workspace,
+  po: { total: number; approval?: PurchaseApproval },
+): boolean {
+  return (
+    s.settings.poApprovalLimit > 0 &&
+    po.total > s.settings.poApprovalLimit &&
+    !(po.approval && po.approval.amount >= po.total)
+  );
+}
+function createPurchase(s: Workspace, data: PurchaseInput): Purchase {
   required(contact(s, data.supplierId)?.type === 'Supplier', 'Select a supplier.');
   required(warehouse(s, data.warehouseId), 'Select a receiving warehouse.');
   dateCheck(data.date);
   dateCheck(data.expected);
   required(data.expected >= data.date, 'Expected delivery must be on or after the order date.');
-  const lines = normalizedLines(s, data.lines, 'cost');
+  const mappedLines = (data.lines || []).map((l) => {
+    if (l.cost === undefined) {
+      const p = product(s, l.productId);
+      const unit = l.unit ?? p?.unit;
+      if (p && unit) {
+        return {
+          ...l,
+          cost: purchaseLinePrice(s, data.supplierId, l.productId, unit),
+        };
+      }
+    }
+    return l;
+  });
+  const lines = normalizedLines(s, mappedLines, 'cost');
+  const total = sum(lines, (l) => l.qty * l.price);
+  required(total > 0, 'Purchase order total must be greater than zero.');
+
+  if (data.send) {
+    required(
+      !approvalRequired(s, { total }),
+      `Purchase orders over $${formatLimit(s.settings.poApprovalLimit)} need approval before sending.`,
+    );
+    required(data.date <= today(), 'Send date must be between the order date and today.');
+  }
+
   const po: Purchase = {
     id: uid('purchase'),
     number: `PO-${String(s.counters.purchase++).padStart(4, '0')}`,
@@ -3225,13 +3405,13 @@ function createPurchase(s: Workspace, data: PurchaseInput) {
     warehouseId: data.warehouseId,
     date: data.date,
     expected: data.expected,
-    lines,
-    total: sum(lines, (l) => l.qty * l.price),
-    paid: 0,
-    status: 'Ordered',
+    lines: lines.map((l) => ({ ...l, id: uid('pol'), closedQty: 0 })),
+    total,
+    status: 'Draft',
     notes: String(data.notes || ''),
+    createdAt: new Date().toISOString(),
+    createdBy: CURRENT_USER,
   };
-  required(po.total > 0, 'Purchase order total must be greater than zero.');
   s.purchases.unshift(po);
   activity(
     s,
@@ -3239,118 +3419,418 @@ function createPurchase(s: Workspace, data: PurchaseInput) {
     'Purchase order created',
     `${po.number} · ${contact(s, po.supplierId)!.name}`,
   );
+  if (data.send) {
+    sendPurchase(s, po.id, data.date > today() ? today() : data.date);
+  }
+  return po;
+}
+function savePurchase(s: Workspace, data: PurchaseInput, id: string): Purchase {
+  const po = s.purchases.find((p) => p.id === id);
+  required(po && ['Draft', 'Sent'].includes(po.status), 'Only open purchase orders can be edited.');
+  if (po.status === 'Sent') {
+    required(
+      po.supplierId === data.supplierId,
+      "The supplier can't change after the order was sent. Cancel it and create a new one.",
+    );
+  }
+  const poReceipts = s.receipts.filter((r) => r.purchaseId === po.id);
+  if (po.status === 'Sent' && poReceipts.length > 0) {
+    required(
+      po.warehouseId === data.warehouseId,
+      "The warehouse can't change after goods were received.",
+    );
+  }
+  required(contact(s, data.supplierId)?.type === 'Supplier', 'Select a supplier.');
+  required(warehouse(s, data.warehouseId), 'Select a receiving warehouse.');
+  dateCheck(data.date);
+  dateCheck(data.expected);
+  required(data.expected >= data.date, 'Expected delivery must be on or after the order date.');
+
+  const mappedLines = (data.lines || []).map((l) => {
+    if (l.cost === undefined) {
+      const p = product(s, l.productId);
+      const unit = l.unit ?? p?.unit;
+      if (p && unit) {
+        return {
+          ...l,
+          cost: purchaseLinePrice(s, data.supplierId, l.productId, unit),
+        };
+      }
+    }
+    return l;
+  });
+  const normalized = normalizedLines(s, mappedLines, 'cost');
+  const total = sum(normalized, (l) => l.qty * l.price);
+  required(total > 0, 'Purchase order total must be greater than zero.');
+
+  const lineIds = new Set<string>();
+  const lines: PurchaseLine[] = normalized.map((line, index) => {
+    const inputLine = (data.lines || [])[index];
+    const lineId = inputLine?.id;
+    const old = lineId ? po.lines.find((l) => l.id === lineId) : undefined;
+    required(!lineId || old, 'Unknown purchase order line.');
+    const received = old ? receivedQty(s, po, old.id) : 0;
+    const closedQty = old?.closedQty ?? 0;
+    if (po.status === 'Sent' && received > 0) {
+      required(
+        line.productId === old!.productId && line.unit === old!.unit && line.factor === old!.factor,
+        `${old!.name} was already received; its product and unit can't change.`,
+      );
+      required(
+        line.qty >= received + closedQty,
+        `${line.name}: quantity can't go below the ${received} already received.`,
+      );
+    }
+    const result: PurchaseLine = { ...line, id: old?.id || uid('pol'), closedQty };
+    required(!lineIds.has(result.id), 'Purchase order contains duplicate lines.');
+    lineIds.add(result.id);
+    return result;
+  });
+
+  if (po.status === 'Sent') {
+    po.lines.forEach((l) => {
+      if (!lineIds.has(l.id)) {
+        const received = receivedQty(s, po, l.id);
+        required(received === 0, `${l.name} was already received and can't be removed.`);
+      }
+    });
+  }
+
+  po.supplierId = data.supplierId;
+  po.warehouseId = data.warehouseId;
+  po.date = data.date;
+  po.expected = data.expected;
+  po.lines = lines;
+  po.total = total;
+  po.notes = String(data.notes || '');
+
+  if (po.status === 'Sent' && lines.every((l) => openQty(s, po, l) === 0)) {
+    const latestDate =
+      poReceipts
+        .map((r) => r.date)
+        .sort()
+        .reverse()[0] || po.date;
+    po.status = 'Received';
+    po.received = latestDate;
+  }
+
+  if (approvalRequired(s, po) && po.approval) {
+    delete po.approval;
+    if (po.status === 'Sent') {
+      po.status = 'Draft';
+      delete po.sentAt;
+      delete po.sentBy;
+    }
+    activity(s, 'order', 'Purchase order changed — needs approval again', po.number);
+  }
+  return po;
+}
+// ponytail: anyone can approve until roles exist; restrict to managers then
+function approvePurchase(s: Workspace, id: string, note = ''): Purchase {
+  const po = s.purchases.find((p) => p.id === id);
+  required(po, 'Purchase order not found.');
+  required(po.status === 'Draft', 'Only draft purchase orders can be approved.');
+  required(
+    s.settings.poApprovalLimit > 0 && po.total > s.settings.poApprovalLimit,
+    "This purchase order doesn't need approval.",
+  );
+  po.approval = {
+    by: CURRENT_USER,
+    at: new Date().toISOString(),
+    amount: po.total,
+    note: String(note || '').trim(),
+  };
+  activity(s, 'order', 'Purchase order approved', po.number);
+  return po;
+}
+function sendPurchase(s: Workspace, id: string, date = today()): Purchase {
+  const po = s.purchases.find((p) => p.id === id);
+  required(po, 'Purchase order not found.');
+  required(po.status === 'Draft', 'Only draft purchase orders can be sent.');
+  required(
+    !approvalRequired(s, po),
+    `Purchase orders over $${formatLimit(s.settings.poApprovalLimit)} need approval before sending.`,
+  );
+  dateCheck(date);
+  required(
+    date >= po.date && date <= today(),
+    'Send date must be between the order date and today.',
+  );
+  po.status = 'Sent';
+  po.sentAt = date;
+  po.sentBy = CURRENT_USER;
+  activity(s, 'order', 'Purchase order sent', po.number);
   return po;
 }
 function receivePurchase(
   s: Workspace,
   id: string,
-  batches: { code: string; expiry: string }[],
-  date = today(),
-) {
+  input:
+    | PurchaseReceiveInput
+    | Array<{
+        code: string;
+        expiry: string;
+        qty?: number;
+        price?: number;
+        purchaseLineId?: string;
+      }>,
+  legacyDate?: string,
+): Receipt {
   const po = s.purchases.find((p) => p.id === id);
-  required(po && po.status === 'Ordered', 'This purchase order is already received or canceled.');
+  required(po, 'Purchase order not found.');
+  required(po.status !== 'Draft', 'Send this purchase order before receiving it.');
+  required(po.status === 'Sent', 'Only sent purchase orders can be received.');
+
+  const actualInput: PurchaseReceiveInput = Array.isArray(input)
+    ? {
+        date: legacyDate || today(),
+        lines: input.map((item, idx) => ({
+          purchaseLineId: item.purchaseLineId || po.lines[idx]?.id || '',
+          qty: item.qty ?? (po.lines[idx] ? openQty(s, po, po.lines[idx].id) : 0),
+          price: item.price,
+          code: item.code,
+          expiry: item.expiry,
+        })),
+      }
+    : input;
+
+  const date = actualInput.date || today();
   dateCheck(date);
   required(
     date >= po.date && date <= today(),
     'Receipt date must be between the order date and today.',
   );
-  required(batches.length === po.lines.length, 'Enter batch details for each order line.');
-  // Validate all receipts before applying any of them.
-  po.lines.forEach((l, i) => {
-    const b = batches[i];
-    dateCheck(b.expiry);
-    required(daysLeft(b.expiry) > 0, 'Every expiry date must be in the future.');
-    required(String(b.code || '').trim(), 'Enter every batch number.');
+  required(
+    Array.isArray(actualInput.lines) && actualInput.lines.length > 0,
+    'Enter the quantity received for at least one line.',
+  );
+
+  const supplier = contact(s, po.supplierId);
+  required(supplier, 'Supplier not found.');
+
+  type ParsedLine = {
+    poLine: PurchaseLine;
+    qty: number;
+    price: number;
+    batchCost: number;
+    code: string;
+    expiry: string;
+  };
+
+  const parsedLines: ParsedLine[] = [];
+  const lineQtyMap = new Map<string, number>();
+
+  for (let i = 0; i < actualInput.lines.length; i++) {
+    const item = actualInput.lines[i];
+    const poLine = po.lines.find((l) => l.id === item.purchaseLineId);
+    required(poLine, 'Unknown purchase order line.');
+
+    const qty = qtyCheck(item.qty);
+    const price = item.price !== undefined ? moneyCheck(item.price, 'Unit cost') : poLine.price;
+    const batchCost = round(price / poLine.factor);
+
+    dateCheck(item.expiry);
+    required(daysLeft(item.expiry) > 0, 'Every expiry date must be in the future.');
+    const code = String(item.code || '').trim();
+    required(code, 'Enter every batch number.');
+
     const existing = s.batches.find(
       (x) =>
-        x.productId === l.productId &&
-        x.code.toLowerCase() === String(b.code).trim().toLowerCase() &&
+        x.productId === poLine.productId &&
+        x.code.toLowerCase() === code.toLowerCase() &&
         x.warehouseId === po.warehouseId &&
         !x.quarantined,
     );
     required(
-      !existing || (existing.expiry === b.expiry && existing.cost === round(l.price / l.factor)),
+      !existing || (existing.expiry === item.expiry && existing.cost === batchCost),
       'An existing batch has conflicting expiry or cost.',
     );
-    for (let j = 0; j < i; j++)
+
+    for (let j = 0; j < i; j++) {
+      const prev = parsedLines[j];
       if (
-        po.lines[j].productId === l.productId &&
-        String(batches[j].code).trim().toLowerCase() === String(b.code).trim().toLowerCase()
-      )
+        prev.poLine.productId === poLine.productId &&
+        prev.code.toLowerCase() === code.toLowerCase()
+      ) {
         required(
-          batches[j].expiry === b.expiry &&
-            round(po.lines[j].price / po.lines[j].factor) === round(l.price / l.factor),
+          prev.expiry === item.expiry && prev.batchCost === batchCost,
           'Duplicate lot numbers must have matching expiry and cost.',
         );
-  });
-  po.lines.forEach((l, i) =>
-    addBatch(
+      }
+    }
+
+    lineQtyMap.set(poLine.id, (lineQtyMap.get(poLine.id) || 0) + qty);
+    parsedLines.push({
+      poLine,
+      qty,
+      price,
+      batchCost,
+      code,
+      expiry: item.expiry,
+    });
+  }
+
+  for (const [lineId, totalQty] of lineQtyMap.entries()) {
+    const poLine = po.lines.find((l) => l.id === lineId)!;
+    const open = openQty(s, po, poLine);
+    required(
+      totalQty <= open,
+      `${poLine.name}: only ${open} ${poLine.unit} still open on this order. Raise the PO quantity first.`,
+    );
+  }
+
+  const receiptNumber = `GRN-${String(s.counters.receipt++).padStart(4, '0')}`;
+  const receiptId = uid('receipt');
+  const receiptTotal = round(sum(parsedLines, (l) => l.qty * l.price));
+  const due = shift(supplier.paymentTermsDays, date);
+
+  const receiptLines: ReceiptLine[] = [];
+
+  for (const line of parsedLines) {
+    const batch = addBatch(
       s,
       {
-        productId: l.productId,
-        qty: l.qty * l.factor,
-        cost: round(l.price / l.factor),
+        productId: line.poLine.productId,
+        qty: line.qty * line.poLine.factor,
+        cost: line.batchCost,
         warehouseId: po.warehouseId,
-        code: batches[i].code,
-        expiry: batches[i].expiry,
+        code: line.code,
+        expiry: line.expiry,
         received: date,
       },
-      { date, reference: po.number, sourceId: po.id, counterpartyId: po.supplierId },
-    ),
+      {
+        date,
+        reference: receiptNumber,
+        sourceId: receiptId,
+        counterpartyId: po.supplierId,
+      },
+    );
+
+    receiptLines.push({
+      productId: line.poLine.productId,
+      name: line.poLine.name,
+      sku: line.poLine.sku,
+      unit: line.poLine.unit,
+      factor: line.poLine.factor,
+      qty: line.qty,
+      price: line.price,
+      orderedPrice: line.poLine.price,
+      purchaseLineId: line.poLine.id,
+      batchId: batch.id,
+      lotCode: batch.code,
+      expiry: batch.expiry,
+    });
+  }
+
+  const receipt: Receipt = {
+    id: receiptId,
+    number: receiptNumber,
+    date,
+    supplierId: po.supplierId,
+    warehouseId: po.warehouseId,
+    purchaseId: po.id,
+    reference: String(actualInput.reference || '').trim(),
+    lines: receiptLines,
+    total: receiptTotal,
+    paid: 0,
+    credited: 0,
+    due,
+    notes: String(actualInput.notes || '').trim(),
+    createdAt: new Date().toISOString(),
+    createdBy: CURRENT_USER,
+  };
+  s.receipts.unshift(receipt);
+
+  const inventoryDebit = sum(receiptLines, (l) =>
+    round(l.qty * l.factor * round(l.price / l.factor)),
   );
-  const inventoryDebit = sum(po.lines, (l) => round(l.qty * l.factor * round(l.price / l.factor)));
+
   ledger(
     s,
     date,
-    po.number,
-    'Purchase receipt — ' +
-      contact(s, po.supplierId)!.name +
-      (po.total !== inventoryDebit ? ' · Purchase rounding' : ''),
-    purchaseEntries(inventoryDebit, po.total, 'payable'),
+    receipt.number,
+    'Goods receipt — ' +
+      supplier.name +
+      ' · ' +
+      po.number +
+      (receipt.total !== inventoryDebit ? ' · Purchase rounding' : ''),
+    purchaseEntries(inventoryDebit, receipt.total, 'payable'),
   );
-  po.status = 'Received';
-  po.received = date;
+
+  if (actualInput.closeRemaining) {
+    closeRemaining(s, po.id, actualInput.closeRemaining.reason);
+  } else if (po.lines.every((l) => openQty(s, po, l) === 0)) {
+    po.status = 'Received';
+    po.received = date;
+  }
+
   activity(
     s,
     'receive',
-    'Purchase order received',
-    `${po.number} · ${warehouse(s, po.warehouseId)!.name}`,
+    'Goods received',
+    `${receipt.number} · ${po.number} · ${warehouse(s, po.warehouseId)!.name}`,
     date,
   );
+
+  return receipt;
+}
+function closeRemaining(s: Workspace, id: string, reason: string): Purchase {
+  const po = s.purchases.find((p) => p.id === id);
+  required(po, 'Purchase order not found.');
+  required(po.status === 'Sent', 'Only sent purchase orders can be closed.');
+  const poReceipts = s.receipts.filter((r) => r.purchaseId === po.id);
+  required(poReceipts.length > 0, 'Nothing was received yet. Cancel the order instead.');
+  const r = String(reason || '').trim();
+  required(r, 'Enter a reason for closing the rest of the order.');
+  for (const line of po.lines) {
+    line.closedQty += openQty(s, po, line);
+  }
+  po.status = 'Received';
+  const latestDate =
+    poReceipts
+      .map((rc) => rc.date)
+      .sort()
+      .reverse()[0] || po.date;
+  po.received = latestDate;
+  po.closeReason = r;
+  activity(s, 'order', 'Purchase order closed short', po.number);
+  return po;
 }
 function payBill(s: Workspace, id: string, amount: NumericInput, date = today()) {
-  const bill = [...s.purchases.filter((p) => p.status === 'Received'), ...s.receipts].find(
-    (x) => x.id === id,
-  );
+  const bill = s.receipts.find((x) => x.id === id);
   required(bill, 'This supplier bill is not ready for payment.');
   amount = moneyCheck(amount);
   required(
-    amount > 0 && amount <= round(bill.total - bill.paid),
+    amount > 0 && amount <= billBalance(bill),
     'Payment must be positive and cannot exceed the bill balance.',
   );
   dateCheck(date);
   required(
-    date >= (bill.received || bill.date) && date <= today(),
+    date >= bill.date && date <= today(),
     'Choose a payment date between receipt and today.',
   );
   bill.paid = round(bill.paid + Number(amount));
-  ledger(s, date, bill.number || bill.reference || bill.id, 'Supplier payment', [
+  ledger(s, date, bill.number, 'Supplier payment', [
     { account: 'payable', debit: amount },
     { account: 'cash', credit: amount },
   ]);
-  activity(
-    s,
-    'payment',
-    'Supplier payment recorded',
-    bill.number || bill.reference || bill.id,
-    date,
-  );
+  activity(s, 'payment', 'Supplier payment recorded', bill.number, date);
 }
-function cancelPurchase(s: Workspace, id: string) {
+function cancelPurchase(s: Workspace, id: string, reason = ''): Purchase {
   const p = s.purchases.find((x) => x.id === id);
-  required(p?.status === 'Ordered', 'Only unreceived orders can be canceled.');
+  required(p && ['Draft', 'Sent'].includes(p.status), 'Only open purchase orders can be canceled.');
+  required(
+    !s.receipts.some((r) => r.purchaseId === p.id),
+    'Part of this order was already received. Close the remainder instead.',
+  );
+  if (p.status === 'Sent') {
+    required(String(reason || '').trim(), 'Enter a reason for canceling a sent order.');
+  }
   p.status = 'Canceled';
+  const r = String(reason || '').trim();
+  if (r) p.cancelReason = r;
   activity(s, 'order', 'Purchase order canceled', p.number);
+  return p;
 }
 function addExpense(s: Workspace, data: ExpenseInput) {
   const amount = moneyCheck(data.amount);
@@ -3383,6 +3863,13 @@ function accountDays(value: unknown, label: string): number {
   );
   return Number(value);
 }
+function setPurchaseSettings(s: Workspace, data: { poApprovalLimit: NumericInput } | NumericInput) {
+  const value =
+    typeof data === 'object' && data !== null && 'poApprovalLimit' in data
+      ? (data as { poApprovalLimit: NumericInput }).poApprovalLimit
+      : data;
+  s.settings.poApprovalLimit = moneyCheck(value, 'Approval limit');
+}
 function setAccountSettings(
   s: Workspace,
   data: { defaultPaymentTermsDays: NumericInput; overdueGraceDays: NumericInput },
@@ -3400,23 +3887,40 @@ function accountDefaults(s: Workspace) {
     onHold: false,
     holdReason: '',
     billing: 'per_delivery' as const,
+    leadTimeDays: 0,
+    minOrderValue: null,
   };
 }
 function validateAccount(s: Workspace, c: Contact) {
   accountDays(c.paymentTermsDays, 'Payment terms');
+  accountDays(c.leadTimeDays, 'Lead time');
   required(
-    c.creditLimit === null || typeof c.creditLimit === 'number',
-    'Enter a valid credit limit.',
+    c.minOrderValue === null || typeof c.minOrderValue === 'number',
+    'Minimum order must be a number or null.',
   );
-  if (c.creditLimit !== null) moneyCheck(c.creditLimit, 'Credit limit');
-  required(typeof c.onHold === 'boolean', 'On hold must be a boolean.');
-  required(typeof c.holdReason === 'string', 'Enter a hold reason.');
-  required(!c.onHold || c.holdReason.trim(), 'Enter a hold reason.');
-  required(
-    c.groupId === '' || s.customerGroups.some((g) => g.id === c.groupId),
-    'Select a valid customer group.',
-  );
-  required(['per_delivery', 'monthly'].includes(c.billing), 'Select a valid billing habit.');
+  if (c.minOrderValue !== null) {
+    moneyCheck(c.minOrderValue, 'Minimum order');
+    required(c.minOrderValue > 0, 'Minimum order must be greater than zero.');
+  }
+  if (c.type === 'Customer') {
+    required(
+      c.leadTimeDays === 0 && c.minOrderValue === null,
+      'Customer must have default lead time and minimum order.',
+    );
+    required(
+      c.creditLimit === null || typeof c.creditLimit === 'number',
+      'Enter a valid credit limit.',
+    );
+    if (c.creditLimit !== null) moneyCheck(c.creditLimit, 'Credit limit');
+    required(typeof c.onHold === 'boolean', 'On hold must be a boolean.');
+    required(typeof c.holdReason === 'string', 'Enter a hold reason.');
+    required(!c.onHold || c.holdReason.trim(), 'Enter a hold reason.');
+    required(
+      c.groupId === '' || s.customerGroups.some((g) => g.id === c.groupId),
+      'Select a valid customer group.',
+    );
+    required(['per_delivery', 'monthly'].includes(c.billing), 'Select a valid billing habit.');
+  }
 }
 function saveCustomerGroup(
   s: Workspace,
@@ -3470,6 +3974,7 @@ function contactInUse(s: Workspace, id: string): boolean {
 function saveContact(s: Workspace, data: ContactInput, id?: string) {
   required(['Customer', 'Supplier'].includes(data.type), 'Select a contact type.');
   required(String(data.name || '').trim().length >= 2, 'Enter a contact name.');
+  const old = id ? contact(s, id) : undefined;
   const c: Contact = {
     ...accountDefaults(s),
     id: id || uid('contact'),
@@ -3483,12 +3988,12 @@ function saveContact(s: Workspace, data: ContactInput, id?: string) {
       data.type === 'Supplier' || data.minShelfLifeDays === null || data.minShelfLifeDays === ''
         ? null
         : data.minShelfLifeDays === undefined
-          ? id
-            ? (contact(s, id)?.minShelfLifeDays ?? null)
-            : null
+          ? (old?.minShelfLifeDays ?? null)
           : shelfLifeCheck(Number(data.minShelfLifeDays)),
   };
   if (c.type === 'Customer') {
+    c.leadTimeDays = 0;
+    c.minOrderValue = null;
     const old = id ? contact(s, id) : undefined;
     c.groupId = data.groupId ?? old?.groupId ?? '';
     c.paymentTermsDays =
@@ -3504,6 +4009,25 @@ function saveContact(s: Workspace, data: ContactInput, id?: string) {
     c.onHold = data.onHold ?? old?.onHold ?? false;
     c.holdReason = String(data.holdReason ?? old?.holdReason ?? '').trim();
     c.billing = data.billing ?? old?.billing ?? 'per_delivery';
+    validateAccount(s, c);
+  } else if (c.type === 'Supplier') {
+    c.paymentTermsDays =
+      data.paymentTermsDays === undefined
+        ? (old?.paymentTermsDays ?? s.settings.defaultPaymentTermsDays)
+        : accountDays(Number(data.paymentTermsDays), 'Payment terms');
+    c.leadTimeDays =
+      data.leadTimeDays === undefined
+        ? (old?.leadTimeDays ?? 0)
+        : accountDays(Number(data.leadTimeDays), 'Lead time');
+    if (data.minOrderValue === undefined) {
+      c.minOrderValue = old?.minOrderValue ?? null;
+    } else if (data.minOrderValue === null || data.minOrderValue === '') {
+      c.minOrderValue = null;
+    } else {
+      const val = moneyCheck(data.minOrderValue, 'Minimum order');
+      required(val > 0, 'Minimum order must be greater than zero.');
+      c.minOrderValue = val;
+    }
     validateAccount(s, c);
   }
   if (id) {
@@ -3744,6 +4268,7 @@ function emptyWorkspace(s: Workspace): Workspace {
       delivery: 1,
       creditNote: 1,
       payment: 1,
+      receipt: 1,
     },
     products: [],
     batches: [],
@@ -3771,7 +4296,7 @@ function emptyWorkspace(s: Workspace): Workspace {
 }
 function seed(): Workspace {
   const s: Workspace = {
-    version: 3,
+    version: 4,
     createdAt: today(),
     settings: {
       company: 'Aster Pharmaceuticals',
@@ -3785,6 +4310,7 @@ function seed(): Workspace {
       minShelfLifeDays: 0,
       defaultPaymentTermsDays: 30,
       overdueGraceDays: 7,
+      poApprovalLimit: 2000,
     },
     counters: {
       invoice: 1024,
@@ -3798,6 +4324,7 @@ function seed(): Workspace {
       delivery: 1,
       creditNote: 1,
       payment: 1,
+      receipt: 1,
     },
     products: [],
     batches: [],
@@ -3911,6 +4438,9 @@ function seed(): Workspace {
       email: 'sales@medicore.example',
       phone: '+855 23 884 990',
       address: 'Khan Sen Sok, Phnom Penh',
+      paymentTermsDays: 30,
+      leadTimeDays: 2,
+      minOrderValue: null,
     },
     {
       id: 's2',
@@ -3921,6 +4451,9 @@ function seed(): Workspace {
       email: 'orders@biohealth.example',
       phone: '+855 23 688 241',
       address: 'Khan Meanchey, Phnom Penh',
+      paymentTermsDays: 45,
+      leadTimeDays: 5,
+      minOrderValue: 500,
     },
     {
       id: 's3',
@@ -3931,6 +4464,9 @@ function seed(): Workspace {
       email: 'team@pacificmed.example',
       phone: '+855 12 851 277',
       address: 'Khan Toul Kork, Phnom Penh',
+      paymentTermsDays: 15,
+      leadTimeDays: 3,
+      minOrderValue: null,
     },
     {
       id: 's4',
@@ -3941,6 +4477,9 @@ function seed(): Workspace {
       email: 'supply@vitawell.example',
       phone: '+855 15 663 818',
       address: 'Khan Chamkar Mon, Phnom Penh',
+      paymentTermsDays: 0,
+      leadTimeDays: 7,
+      minOrderValue: 300,
     },
   ].forEach((data) => {
     const c = saveContact(s, { ...data, type: data.type as Contact['type'] });
@@ -4386,7 +4925,9 @@ function seed(): Workspace {
       lines: LineInput[] = [
         n === 0
           ? { productId: 'p1', qty: 3, unit: 'carton', cost: 160 }
-          : { productId: 'p' + (n + 1), qty: 120 + n * 12, cost: specs[n][4] },
+          : n === 1
+            ? { productId: 'p2', qty: 132, cost: 8.2 }
+            : { productId: 'p' + (n + 1), qty: 120 + n * 12, cost: specs[n][4] },
         { productId: 'p' + (n + 8), qty: 90, cost: specs[n + 7][4] },
       ];
     const po = createPurchase(s, {
@@ -4396,13 +4937,18 @@ function seed(): Workspace {
       expected: shift(5, date),
       lines,
     });
-    receivePurchase(
-      s,
-      po.id,
-      po.lines.map((_, i) => ({ code: `RC-${n + 1}-${i + 1}`, expiry: shift(430 + n * 10) })),
-      shift(4, date),
-    );
-    if (n < 4) payBill(s, po.id, po.total, shift(7, date));
+    if (approvalRequired(s, po)) approvePurchase(s, po.id, 'Approved');
+    sendPurchase(s, po.id, date);
+    const rc = receivePurchase(s, po.id, {
+      date: shift(4, date),
+      lines: po.lines.map((l, i) => ({
+        purchaseLineId: l.id,
+        qty: l.qty,
+        code: `RC-${n + 1}-${i + 1}`,
+        expiry: shift(430 + n * 10),
+      })),
+    });
+    if (n < 4) payBill(s, rc.id, rc.total, shift(7, date));
   }
   const sellIds = s.products
     .filter((p) => !['p2', 'p10', 'p15', 'p21'].includes(p.id))
@@ -4467,25 +5013,123 @@ function seed(): Workspace {
       category: 'Logistics',
     });
   }
-  createPurchase(s, {
+  const openPo1 = createPurchase(s, {
     supplierId: 's2',
     warehouseId: 'wh_main',
     date: shift(-3),
-    expected: shift(3),
+    expected: expectedDate(s, 's2', shift(-3)),
     lines: [
-      { productId: 'p2', qty: 200, cost: 8.5 },
+      { productId: 'p5', qty: 180, cost: 8.5 },
       { productId: 'p10', qty: 80, cost: 4.8 },
     ],
     notes: 'Priority replenishment for low-stock products.',
   });
-  createPurchase(s, {
+  sendPurchase(s, openPo1.id, shift(-3));
+  receivePurchase(s, openPo1.id, {
+    date: shift(-2),
+    lines: [
+      {
+        purchaseLineId: openPo1.lines[0].id,
+        qty: 90,
+        code: 'LOT-SEED-PART-1',
+        expiry: shift(365),
+      },
+    ],
+  });
+
+  const openPo2 = createPurchase(s, {
     supplierId: 's3',
     warehouseId: 'wh_branch',
     date: shift(-1),
-    expected: shift(5),
+    expected: expectedDate(s, 's3', shift(-1)),
     lines: [
       { productId: 'p15', qty: 250, cost: 1.8 },
       { productId: 'p21', qty: 100, cost: 12.6 },
+    ],
+  });
+  sendPurchase(s, openPo2.id, shift(-1));
+
+  createPurchase(s, {
+    supplierId: 's1',
+    warehouseId: 'wh_main',
+    date: today(),
+    expected: expectedDate(s, 's1', today()),
+    lines: [{ productId: 'p1', qty: 15, unit: 'carton', cost: 160 }],
+    notes: 'Bulk stock-up for main distribution.',
+  });
+
+  const approvedPo = createPurchase(s, {
+    supplierId: 's4',
+    warehouseId: 'wh_main',
+    date: shift(-2),
+    expected: expectedDate(s, 's4', shift(-2)),
+    lines: [{ productId: 'p4', qty: 100, cost: 22 }],
+    notes: 'Quarterly order.',
+  });
+  approvePurchase(s, approvedPo.id, 'Quarterly stock-up');
+  sendPurchase(s, approvedPo.id, shift(-2));
+  receivePurchase(s, approvedPo.id, {
+    date: shift(-1),
+    reference: 'INV-UP-201',
+    lines: [
+      {
+        purchaseLineId: approvedPo.lines[0].id,
+        qty: 100,
+        price: 24,
+        code: 'LOT-SEED-PRICE-UP',
+        expiry: shift(400),
+      },
+    ],
+  });
+
+  const closedPo = createPurchase(s, {
+    supplierId: 's3',
+    warehouseId: 'wh_branch',
+    date: shift(-5),
+    expected: expectedDate(s, 's3', shift(-5)),
+    lines: [
+      { productId: 'p15', qty: 100, cost: 1.8 },
+      { productId: 'p21', qty: 50, cost: 12.6 },
+    ],
+  });
+  sendPurchase(s, closedPo.id, shift(-5));
+  receivePurchase(s, closedPo.id, {
+    date: shift(-4),
+    lines: [
+      {
+        purchaseLineId: closedPo.lines[0].id,
+        qty: 40,
+        code: 'LOT-SEED-SHORT-1',
+        expiry: shift(350),
+      },
+    ],
+    closeRemaining: { reason: 'Supplier out of stock until next quarter' },
+  });
+
+  const twoLotsPo = createPurchase(s, {
+    supplierId: 's4',
+    warehouseId: 'wh_main',
+    date: shift(-4),
+    expected: expectedDate(s, 's4', shift(-4)),
+    lines: [{ productId: 'p11', qty: 100, cost: 3.5 }],
+  });
+  sendPurchase(s, twoLotsPo.id, shift(-4));
+  receivePurchase(s, twoLotsPo.id, {
+    date: shift(-3),
+    reference: 'DN-2LOTS',
+    lines: [
+      {
+        purchaseLineId: twoLotsPo.lines[0].id,
+        qty: 60,
+        code: 'LOT-SEED-2A',
+        expiry: shift(300),
+      },
+      {
+        purchaseLineId: twoLotsPo.lines[0].id,
+        qty: 40,
+        code: 'LOT-SEED-2B',
+        expiry: shift(450),
+      },
     ],
   });
   createInvoice(s, {
@@ -4990,7 +5634,7 @@ function migrate(raw: unknown): Workspace {
   required(typeof raw === 'object' && raw !== null, 'This is not a supported Aster backup.');
   const legacy = raw as { version?: number };
   required(
-    legacy.version === 1 || legacy.version === 2 || legacy.version === 3,
+    legacy.version === 1 || legacy.version === 2 || legacy.version === 3 || legacy.version === 4,
     'This is not a supported Aster backup.',
   );
   const s = raw as Workspace;
@@ -5030,6 +5674,8 @@ function migrate(raw: unknown): Workspace {
   if (s.counters.order === undefined) s.counters.order = 1;
   if (s.customerGroups === undefined) s.customerGroups = [];
   if (s.prices === undefined) s.prices = [];
+  if (s.receipts === undefined) s.receipts = [];
+  if (s.counters.receipt === undefined) s.counters.receipt = 1;
   if (Array.isArray(s.customerGroups))
     s.customerGroups.forEach((g) => {
       if (g.discountPercent === undefined) g.discountPercent = 0;
@@ -5037,11 +5683,18 @@ function migrate(raw: unknown): Workspace {
   if (s.settings) {
     if (s.settings.defaultPaymentTermsDays === undefined) s.settings.defaultPaymentTermsDays = 30;
     if (s.settings.overdueGraceDays === undefined) s.settings.overdueGraceDays = 7;
+    if (s.settings.poApprovalLimit === undefined) s.settings.poApprovalLimit = 2000;
   }
   if (s.settings?.minShelfLifeDays === undefined && s.settings) s.settings.minShelfLifeDays = 180;
   if (Array.isArray(s.contacts))
     s.contacts.forEach((c) => {
       if (c.minShelfLifeDays === undefined) c.minShelfLifeDays = null;
+      if (c.leadTimeDays === undefined) c.leadTimeDays = 0;
+      if (c.minOrderValue === undefined) c.minOrderValue = null;
+      if (c.type === 'Customer') {
+        c.leadTimeDays = 0;
+        c.minOrderValue = null;
+      }
       const defaults = accountDefaults(s);
       for (const key of Object.keys(defaults) as Array<keyof typeof defaults>)
         if (c[key] === undefined) Object.assign(c, { [key]: defaults[key] });
@@ -5082,9 +5735,22 @@ function migrate(raw: unknown): Workspace {
           });
       });
   }
+  if (Array.isArray(s.purchases))
+    s.purchases.forEach((p) => {
+      if ((p.status as string) === 'Ordered') {
+        p.status = 'Sent';
+        if (p.sentAt === undefined) p.sentAt = p.date;
+        if (p.sentBy === undefined) p.sentBy = CURRENT_USER;
+      } else if (p.status === 'Received') {
+        if (p.sentAt === undefined) p.sentAt = p.date;
+        if (p.sentBy === undefined) p.sentBy = CURRENT_USER;
+      }
+      if (p.createdAt === undefined) p.createdAt = `${p.date}T00:00:00.000Z`;
+      if (p.createdBy === undefined) p.createdBy = CURRENT_USER;
+    });
   if (s.deliveries === undefined) s.deliveries = [];
   if (s.counters.delivery === undefined) s.counters.delivery = 1;
-  if (legacy.version !== 3 && Array.isArray(s.invoices))
+  if (legacy.version < 3 && Array.isArray(s.invoices))
     [...s.invoices].reverse().forEach((invoice) => {
       const old = invoice as Invoice & {
         allocations?: {
@@ -5222,7 +5888,149 @@ function migrate(raw: unknown): Workspace {
           createdBy: CURRENT_USER,
         });
     });
-  s.version = 3;
+  if (legacy.version < 4) {
+    if (Array.isArray(s.purchases)) {
+      s.purchases.forEach((p) => {
+        if ((p as any).paid !== undefined) {
+          delete (p as any).closeReason;
+        }
+        if (Array.isArray(p.lines)) {
+          p.lines.forEach((l) => {
+            if (!l.id) l.id = uid('pol');
+            if (l.closedQty === undefined || (p as any).paid !== undefined) {
+              l.closedQty = 0;
+            }
+          });
+        }
+      });
+    }
+    const existingReceipts = Array.isArray(s.receipts) ? [...s.receipts] : [];
+    type OldBillItem =
+      | { kind: 'po'; po: Purchase; date: string }
+      | { kind: 'receipt'; receipt: Receipt; date: string };
+    const oldBills: OldBillItem[] = [];
+    if (Array.isArray(s.purchases)) {
+      s.purchases
+        .filter((p) => p.status === 'Received')
+        .forEach((po) => {
+          oldBills.push({ kind: 'po', po, date: po.received ?? po.date });
+        });
+    }
+    const isReceivedPoReceipt = (r: Receipt) =>
+      !!r.purchaseId &&
+      Array.isArray(s.purchases) &&
+      s.purchases.some((p) => p.id === r.purchaseId && p.status === 'Received');
+    if (Array.isArray(s.receipts)) {
+      s.receipts
+        .filter((r) => !isReceivedPoReceipt(r))
+        .forEach((receipt) => {
+          oldBills.push({
+            kind: 'receipt',
+            receipt,
+            date: receipt.date ?? (receipt as any).received ?? today(),
+          });
+        });
+    }
+    oldBills.sort((a, b) => a.date.localeCompare(b.date));
+    const migratedReceipts: Receipt[] = [];
+    for (const item of oldBills) {
+      if (item.kind === 'po') {
+        const po = item.po;
+        const supp = contact(s, po.supplierId);
+        const date = item.date;
+        const moves = (s.stockMoves || []).filter(
+          (m) => m.type === 'receipt' && m.sourceId === po.id,
+        );
+        const matchMoves = moves.length === po.lines.length;
+        const existingReceipt = existingReceipts.find((r) => r.purchaseId === po.id);
+        const isRealLegacy = (po as any).paid !== undefined;
+        const number =
+          !isRealLegacy && existingReceipt?.number
+            ? existingReceipt.number
+            : `GRN-${String(s.counters.receipt++).padStart(4, '0')}`;
+        const useExisting =
+          !isRealLegacy &&
+          existingReceipt &&
+          existingReceipt.lines.every((el) =>
+            po.lines.some((pl) => pl.id === el.purchaseLineId && pl.unit === el.unit),
+          );
+        const lines: ReceiptLine[] = useExisting
+          ? existingReceipt.lines
+          : po.lines.map((l: PurchaseLine, idx: number) => {
+              const move = matchMoves ? moves[idx] : undefined;
+              const b = move ? s.batches.find((batch) => batch.id === move.batchId) : undefined;
+              return {
+                productId: l.productId,
+                name: l.name,
+                sku: l.sku,
+                unit: l.unit,
+                factor: l.factor,
+                qty: l.qty,
+                price: l.price,
+                orderedPrice: l.price,
+                purchaseLineId: l.id,
+                batchId: b?.id || move?.batchId || '',
+                lotCode: b?.code || move?.lotCode || '',
+                expiry: b?.expiry || '',
+              };
+            });
+        const total = isRealLegacy
+          ? po.total
+          : useExisting
+            ? existingReceipt.total
+            : sum(lines, (l) => l.qty * l.price);
+        const paid = isRealLegacy ? (po as any).paid : (existingReceipt?.paid ?? 0);
+        migratedReceipts.push({
+          id: !isRealLegacy && existingReceipt?.id ? existingReceipt.id : uid('receipt'),
+          number,
+          date,
+          supplierId: po.supplierId,
+          warehouseId: po.warehouseId,
+          purchaseId: po.id,
+          reference: po.reference ?? '',
+          lines,
+          total,
+          paid,
+          credited: 0,
+          due:
+            !isRealLegacy && existingReceipt?.due
+              ? existingReceipt.due
+              : shift(supp?.paymentTermsDays ?? 30, date),
+          notes: !isRealLegacy && existingReceipt?.notes !== undefined ? existingReceipt.notes : '',
+          legacy: true,
+          createdAt:
+            !isRealLegacy && existingReceipt?.createdAt
+              ? existingReceipt.createdAt
+              : `${date}T12:00:00.000Z`,
+          createdBy:
+            !isRealLegacy && existingReceipt?.createdBy ? existingReceipt.createdBy : CURRENT_USER,
+        });
+      } else {
+        const r = item.receipt;
+        const supp = contact(s, r.supplierId);
+        if (!r.number) r.number = `GRN-${String(s.counters.receipt++).padStart(4, '0')}`;
+        if (r.lines === undefined) r.lines = [];
+        if (!r.reference) r.reference = '';
+        r.credited = 0;
+        r.due = shift(supp?.paymentTermsDays ?? 30, r.date);
+        r.notes = r.notes ?? '';
+        r.legacy = true;
+        if (r.createdAt === undefined) r.createdAt = `${r.date}T12:00:00.000Z`;
+        if (r.createdBy === undefined) r.createdBy = CURRENT_USER;
+        delete (r as any).received;
+        migratedReceipts.push(r as Receipt);
+      }
+    }
+    s.receipts = migratedReceipts;
+    const maxGrn = Math.max(0, ...s.receipts.map((r) => Number(r.number.slice(4)) || 0));
+    if (s.counters.receipt <= maxGrn) s.counters.receipt = maxGrn + 1;
+    if (Array.isArray(s.purchases)) {
+      s.purchases.forEach((p) => {
+        delete (p as any).paid;
+      });
+    }
+  }
+  s.version = 4;
   return s;
 }
 function validateBackup(value: unknown): Workspace {
@@ -5264,6 +6072,7 @@ function validateBackup(value: unknown): Workspace {
       'warehouses',
       'invoices',
       'purchases',
+      'receipts',
       'adjustments',
       'stockCounts',
       'recalls',
@@ -5291,6 +6100,11 @@ function validateBackup(value: unknown): Workspace {
   );
   accountDays(s.settings.defaultPaymentTermsDays, 'Default payment terms');
   accountDays(s.settings.overdueGraceDays, 'Overdue grace period');
+  moneyCheck(s.settings.poApprovalLimit, 'Approval limit');
+  required(
+    s.settings.poApprovalLimit >= 0,
+    'Approval limit must be greater than or equal to zero.',
+  );
   s.contacts.forEach((c) => validateAccount(s, c));
   const groupNames = new Set<string>();
   s.customerGroups.forEach((g) => {
@@ -5571,7 +6385,9 @@ function validateBackup(value: unknown): Workspace {
       Number.isSafeInteger(s.counters.delivery) &&
       s.counters.delivery > 0 &&
       Number.isSafeInteger(s.counters.creditNote) &&
-      s.counters.creditNote > 0,
+      s.counters.creditNote > 0 &&
+      Number.isSafeInteger(s.counters.receipt) &&
+      s.counters.receipt > 0,
     'Invalid record counters in backup.',
   );
   s.products.forEach((p) => required(Array.isArray(p.packs), 'Product packaging is missing.'));
@@ -6393,10 +7209,17 @@ function validateBackup(value: unknown): Workspace {
         ids.warehouses.has(p.warehouseId) &&
         Array.isArray(p.lines) &&
         p.lines.length &&
-        ['Ordered', 'Received', 'Canceled'].includes(p.status),
+        ['Draft', 'Sent', 'Received', 'Canceled'].includes(p.status),
       'Invalid purchase order.',
     );
+    required((p as any).paid === undefined, 'Purchase orders cannot have paid balance.');
+    const lineIds = new Set<string>();
     p.lines.forEach((l) => {
+      required(
+        typeof l.id === 'string' && l.id && !lineIds.has(l.id),
+        'Invalid or duplicate purchase order line identifier.',
+      );
+      lineIds.add(l.id);
       required(ids.products.has(l.productId), 'Unknown purchase product.');
       qtyCheck(l.qty);
       moneyCheck(l.price);
@@ -6407,17 +7230,152 @@ function validateBackup(value: unknown): Workspace {
           Number.isSafeInteger(l.qty * l.factor),
         'Invalid purchase line unit or factor.',
       );
+      required(
+        Number.isSafeInteger(l.closedQty) && l.closedQty >= 0,
+        'Invalid purchase line closed quantity.',
+      );
+      required(
+        receivedQty(s, p, l.id) + l.closedQty <= l.qty,
+        'Purchase order line received quantity plus closed quantity exceeds ordered quantity.',
+      );
+      required(openQty(s, p, l.id) >= 0, 'Purchase order line cannot have negative open quantity.');
     });
+    required(sum(p.lines, (l) => l.qty * l.price) === p.total, 'Invalid purchase order totals.');
+    if (p.status === 'Received') {
+      required(
+        p.lines.every((l) => openQty(s, p, l.id) === 0),
+        'Received purchase orders cannot have open quantities.',
+      );
+    }
+    if (p.status === 'Sent') {
+      required(
+        p.lines.some((l) => openQty(s, p, l.id) > 0),
+        'Sent purchase orders must have open quantities.',
+      );
+    }
+    if (p.closeReason !== undefined) {
+      required(
+        typeof p.closeReason === 'string' && p.closeReason.trim(),
+        'Invalid purchase close reason.',
+      );
+    }
+    dateCheck(p.date);
+    dateCheck(p.expected);
     required(
-      sum(p.lines, (l) => l.qty * l.price) === p.total && p.paid >= 0 && p.paid <= p.total,
-      'Invalid purchase order totals.',
+      typeof p.createdAt === 'string' &&
+        !isNaN(new Date(p.createdAt).getTime()) &&
+        typeof p.createdBy === 'string' &&
+        p.createdBy.trim(),
+      'Invalid purchase order creation audit.',
     );
+    if (['Sent', 'Received'].includes(p.status)) {
+      required(
+        typeof p.sentAt === 'string' && p.sentAt && typeof p.sentBy === 'string' && p.sentBy.trim(),
+        'Invalid purchase order sent audit.',
+      );
+      dateCheck(p.sentAt);
+    } else if (p.status === 'Draft') {
+      required(
+        p.sentAt === undefined && p.sentBy === undefined,
+        'Draft purchase orders cannot have sent audit.',
+      );
+    }
+    if (p.sentAt !== undefined) {
+      dateCheck(p.sentAt);
+      required(
+        typeof p.sentBy === 'string' && p.sentBy.trim(),
+        'Invalid purchase order sent audit.',
+      );
+    }
+    if (p.approval !== undefined) {
+      const a = p.approval;
+      required(
+        a &&
+          typeof a.by === 'string' &&
+          a.by.trim() &&
+          typeof a.at === 'string' &&
+          !isNaN(new Date(a.at).getTime()) &&
+          moneyCheck(a.amount) === a.amount &&
+          typeof a.note === 'string',
+        'Invalid purchase order approval.',
+      );
+    }
   });
+
+  const receiptNumbers = new Set<string>();
   s.receipts.forEach((r) => {
+    required(
+      typeof r.number === 'string' &&
+        /^GRN-\d{4,}$/.test(r.number) &&
+        !receiptNumbers.has(r.number),
+      'Invalid or duplicate receipt number.',
+    );
+    receiptNumbers.add(r.number);
+    required(
+      Number(r.number.slice(4)) < s.counters.receipt,
+      'Receipt counter must exceed existing receipt numbers.',
+    );
+    required(contact(s, r.supplierId)?.type === 'Supplier', 'Unknown receipt supplier.');
+    required(ids.warehouses.has(r.warehouseId), 'Unknown receipt warehouse.');
+    dateCheck(r.date);
+    dateCheck(r.due);
+    required(r.due >= r.date, 'Receipt due date cannot be before receipt date.');
     moneyCheck(r.total);
     moneyCheck(r.paid);
-    required(r.paid <= r.total && ids.warehouses.has(r.warehouseId), 'Invalid stock receipt.');
+    moneyCheck(r.credited);
+    required(
+      r.paid >= 0 && r.credited >= 0 && round(r.paid + r.credited) <= r.total,
+      'Invalid receipt payment balance.',
+    );
+    if (r.purchaseId !== undefined) {
+      const po = s.purchases.find((p) => p.id === r.purchaseId);
+      required(
+        po && po.supplierId === r.supplierId && po.warehouseId === r.warehouseId,
+        'Invalid receipt purchase order reference.',
+      );
+    }
+    required(Array.isArray(r.lines), 'Receipt lines must be an array.');
+    if (!r.legacy) {
+      required(r.lines.length > 0, 'Receipt must have at least one line.');
+    }
+    r.lines.forEach((l) => {
+      required(ids.products.has(l.productId), 'Unknown receipt product.');
+      qtyCheck(l.qty);
+      moneyCheck(l.price);
+      required(
+        units.includes(l.unit) &&
+          Number.isSafeInteger(l.factor) &&
+          l.factor >= 1 &&
+          Number.isSafeInteger(l.qty * l.factor),
+        'Invalid receipt line unit or factor.',
+      );
+      if (!r.legacy) {
+        const b = s.batches.find((b) => b.id === l.batchId);
+        required(
+          b && b.productId === l.productId && b.warehouseId === r.warehouseId,
+          'Invalid receipt batch reference.',
+        );
+      }
+    });
+    if (!r.legacy || r.lines.length > 0) {
+      required(
+        round(sum(r.lines, (l) => l.qty * l.price)) === r.total,
+        'Receipt total does not match its lines.',
+      );
+    }
   });
+
+  s.receipts
+    .filter((r) => !r.legacy)
+    .forEach((r) => {
+      const moves = s.stockMoves.filter((m) => m.type === 'receipt' && m.sourceId === r.id);
+      required(moves.length === r.lines.length, 'Receipt stock moves do not match its lines.');
+      r.lines.forEach((l) => {
+        const match = moves.find((m) => m.batchId === l.batchId && m.qty === l.qty * l.factor);
+        required(match, 'Receipt line stock move missing or mismatch.');
+      });
+    });
+
   const b = balances(s);
   required(
     b.inventory.balance === inventoryValue(s),
@@ -6435,11 +7393,7 @@ function validateBackup(value: unknown): Workspace {
     'Backup customer balances do not match the ledger.',
   );
   required(
-    b.payable.balance ===
-      sum(
-        [...s.purchases.filter((p) => p.status === 'Received'), ...s.receipts],
-        (p) => p.total - p.paid,
-      ),
+    b.payable.balance === round(sum(s.receipts, billBalance)),
     'Backup supplier balances do not match the ledger.',
   );
   return s;
@@ -6585,9 +7539,25 @@ export const A = {
   payInvoice,
   deleteDraft,
   createPurchase,
+  savePurchase,
+  approvePurchase,
+  sendPurchase,
   receivePurchase,
+  receivedQty,
+  purchaseStatus,
+  billBalance,
+  billStatus,
+  openBills,
+  closeRemaining,
   payBill,
   cancelPurchase,
+  approvalRequired,
+  setPurchaseSettings,
+  lastPurchasePrice,
+  purchaseLinePrice,
+  expectedDate,
+  belowMinimumOrder,
+  accountDays,
   addExpense,
   saveContact,
   saveCustomerGroup,
@@ -6603,4 +7573,5 @@ export const A = {
   seed,
   migrate,
   validateBackup,
+  CURRENT_USER,
 };
